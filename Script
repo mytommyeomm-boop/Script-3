@@ -1,7 +1,5 @@
 --[[ ============================================================
-    AUTO FARM SUITE V2 (Harvest + Water + Sell + Teleport)
-    - แก้ไขระบบ Harvest ให้ทำงานได้แม่นยำขึ้น (อิงตามปุ่มที่โชว์)
-    - เปลี่ยนระบบเดินเป็น "วาป" (Teleport) ทั้งหมด
+    AUTO FARM V4 (Walk + Noclip + Fixed Sell + Minimize UI)
 ============================================================ ]]
 
 local Players           = game:GetService("Players")
@@ -9,6 +7,8 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CollectionService = game:GetService("CollectionService")
 local UserInputService  = game:GetService("UserInputService")
 local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
+local Debris            = game:GetService("Debris")
 
 local LP        = Players.LocalPlayer
 local PlayerGui = LP:WaitForChild("PlayerGui")
@@ -19,6 +19,12 @@ local WaterRemote   = Remotes:WaitForChild("Water", 15)
 local SellRemote    = Remotes:WaitForChild("SellDurians", 15)
 local CatchCancel   = Remotes:FindFirstChild("CatchCancel")
 
+-- โหลด Config ทุเรียนเพื่อแยกประเภท (ทุเรียน/ปาล์ม)
+local DurianConfig
+pcall(function()
+    DurianConfig = require(ReplicatedStorage.Shared:WaitForChild("DurianConfig"))
+end)
+
 -- ============================================================
 -- Config + State
 -- ============================================================
@@ -27,13 +33,13 @@ local Config = {
     Water       = false,
     Sell        = false,
 
-    HarvestRange = 35,     -- เพิ่มระยะให้กว้างขึ้น
+    HarvestRange = 35,
     WaterRange   = 50,     
     SellRange    = 250,    
 
     HarvestMode  = "Proximity",
     AutoPurge    = false,
-    Teleport     = true,   -- เปิดใช้งานวาป
+    Noclip       = true,
     Cooldown     = 0.4,
     ShowRay      = true,
 }
@@ -69,28 +75,18 @@ local function isPurgeNow()
     return ok2 and r or false
 end
 
--- ระบบวาป
-local function teleportTo(pos)
+local function walkTo(pos, timeout)
     local char, root, hum = getChar()
-    if not root or not char then return false end
-    
-    if Config.Teleport then
-        -- วาปไปเหนือพื้นนิดหน่อยเพื่อกันจมพื้น
-        root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
-        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-        task.wait(0.2)
-        return true
-    else
-        -- เดินปกติ (Fallback)
-        local t0 = tick()
-        while tick() - t0 < 5 do
-            if not root.Parent then return false end
-            if (root.Position - pos).Magnitude <= 5 then return true end
-            pcall(function() hum:MoveTo(pos) end)
-            task.wait(0.1)
-        end
-        return false
+    if not root or not hum then return false end
+    timeout = timeout or 12
+    local t0 = tick()
+    while tick() - t0 < timeout do
+        if not root.Parent then return false end
+        if (root.Position - pos).Magnitude <= 6 then return true end
+        pcall(function() hum:MoveTo(pos) end)
+        task.wait(0.1)
     end
+    return false
 end
 
 local function showRay(from, to, color)
@@ -99,7 +95,7 @@ local function showRay(from, to, color)
     local len = dir.Magnitude
     if len < 0.2 then return end
     local mid = from + dir * 0.5
-    -- สร้างชั่วคราวเพื่อไม่ให้ค้าง
+    
     local p = Instance.new("Part")
     p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
     p.CastShadow, p.Material = false, Enum.Material.Neon
@@ -108,9 +104,23 @@ local function showRay(from, to, color)
     p.CFrame = CFrame.lookAt(mid, mid + dir.Unit)
     p.Transparency = 0.5
     p.Parent = workspace
+    
     TweenService:Create(p, TweenInfo.new(0.5), {Transparency = 1}):Play()
-    game:GetService("Debris"):AddItem(p, 0.6)
+    Debris:AddItem(p, 0.6)
 end
+
+-- ============================================================
+-- NOCLIP
+-- ============================================================
+RunService.Stepped:Connect(function()
+    if Config.Noclip and LP.Character then
+        for _, part in ipairs(LP.Character:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide then
+                part.CanCollide = false
+            end
+        end
+    end
+end)
 
 -- ============================================================
 -- HARVEST
@@ -129,10 +139,8 @@ local function canHarvest(fruit)
     local prompt = findPrompt(fruit)
     if not prompt or not prompt.Enabled then return false end
 
-    -- ไม่เช็คฐานแล้ว ให้ยึดตามปุ่มที่โชว์เป็นหลัก
     local unripe = prompt:GetAttribute("Unripe")
     if unripe and not Config.AutoPurge then return false end
-
     return true, prompt, part
 end
 
@@ -189,9 +197,7 @@ end
 local function fireHarvest(target)
     local char = getChar()
     if not char then return false end
-    
-    freeHands() -- วางของในมือก่อน
-    
+    freeHands() 
     local ok = pcall(function() HarvestRemote:FireServer(target.prompt) end)
     if not ok then return false end
 
@@ -225,17 +231,14 @@ local function tryHarvest()
     local target = Config.HarvestMode == "Aim" and findHarvestAim() or findHarvestProximity()
     if not target then Status.Harvest = "NO TARGET" return false end
 
-    -- ถ้าไกลเกิน 15 วาปไปหาเลย
-    if Config.Teleport and target.dist > 15 then
-        Status.Harvest = "WARPING TO FRUIT"
-        local safePos = target.part.Position + Vector3.new(0, 0, 0)
-        teleportTo(safePos)
-        task.wait(0.2)
+    if target.dist > 15 then
+        Status.Harvest = "WALKING TO FRUIT"
+        walkTo(target.part.Position)
+        return true
     end
 
     showRay(root.Position + Vector3.new(0, 2, 0), target.part.Position, Color3.fromRGB(0, 255, 140))
     Status.Harvest = "HARVESTING"
-    
     local ok = fireHarvest(target)
     if ok then
         Stats.Harvested = Stats.Harvested + 1
@@ -247,7 +250,7 @@ local function tryHarvest()
 end
 
 -- ============================================================
--- WATER (วาป)
+-- WATER
 -- ============================================================
 local function findWateringCan()
     local char = LP.Character
@@ -261,15 +264,21 @@ local function findWateringCan()
     end
 end
 
-local function findWell()
+local function getMyBase()
     local map = workspace:FindFirstChild("Map")
     local bases = map and map:FindFirstChild("Bases")
-    if not bases then return end
+    if not bases then return nil end
     for _, b in ipairs(bases:GetChildren()) do
-        if b:GetAttribute("OwnerUserId") == LP.UserId then
-            for _, d in ipairs(b:GetDescendants()) do
-                if d:IsA("BasePart") and d.Name:lower():find("well") then return d.Position end
-            end
+        if b:GetAttribute("OwnerUserId") == LP.UserId then return b end
+    end
+end
+
+local function findWell()
+    local base = getMyBase()
+    if not base then return end
+    for _, d in ipairs(base:GetDescendants()) do
+        if d:IsA("BasePart") and (d.Name == "BuyPad_Well" or d.Name:lower():find("well")) then
+            return d.Position
         end
     end
 end
@@ -277,23 +286,18 @@ end
 local function findWaterTarget()
     local _, root = getChar()
     if not root then return end
-    local map = workspace:FindFirstChild("Map")
-    local bases = map and map:FindFirstChild("Bases")
-    if not bases then return end
+    local base = getMyBase()
+    if not base then return end
 
     local best, bestD = nil, Config.WaterRange
-    for _, b in ipairs(bases:GetChildren()) do
-        if b:GetAttribute("OwnerUserId") == LP.UserId then
-            for _, d in ipairs(b:GetDescendants()) do
-                if d.Name == "PlantSpot" and d:IsA("BasePart") and not wateredSet[d] then
-                    local parent = d.Parent
-                    if parent and (parent:FindFirstChild("Tree") or parent:FindFirstChild("Seed")) then
-                        local dist = (d.Position - root.Position).Magnitude
-                        if dist < bestD then
-                            best = d
-                            bestD = dist
-                        end
-                    end
+    for _, d in ipairs(base:GetDescendants()) do
+        if d.Name == "PlantSpot" and d:IsA("BasePart") and not wateredSet[d] then
+            local parent = d.Parent
+            if parent and (parent:FindFirstChild("Tree") or parent:FindFirstChild("Seed")) then
+                local dist = (d.Position - root.Position).Magnitude
+                if dist < bestD then
+                    best = d
+                    bestD = dist
                 end
             end
         end
@@ -319,15 +323,10 @@ local function tryWater()
         local wellPos = findWell()
         if not wellPos then Status.Water = "NO WELL FOUND" return false end
         
-        if Config.Teleport then
-            Status.Water = "WARPING TO WELL"
-            teleportTo(wellPos)
-        else
-            if (root.Position - wellPos).Magnitude > 10 then
-                Status.Water = "WALK TO WELL"
-                teleportTo(wellPos) -- Fallback เดิน
-                return true
-            end
+        if (root.Position - wellPos).Magnitude > 10 then
+            Status.Water = "WALKING TO WELL"
+            walkTo(wellPos)
+            return true
         end
         
         WaterRemote:FireServer("Water", char:GetPivot().Position)
@@ -340,9 +339,9 @@ local function tryWater()
     if not target then Status.Water = "ALL DONE" return false end
 
     if dist > 10 then
-        Status.Water = "WARPING TO PLANT"
-        teleportTo(target.Position)
-        task.wait(0.2)
+        Status.Water = "WALKING TO PLANT"
+        walkTo(target.Position)
+        return true
     end
 
     local usesBefore = LP:GetAttribute("WaterUses") or 0
@@ -362,27 +361,8 @@ local function tryWater()
 end
 
 -- ============================================================
--- SELL (วาป)
+-- SELL
 -- ============================================================
-local function findBuyer()
-    local _, root = getChar()
-    if not root then return end
-    local best, bestD = nil, Config.SellRange
-    for _, d in ipairs(workspace:GetDescendants()) do
-        if d:IsA("Model") and d:GetAttribute("BuyerKind") then
-            local part = d:FindFirstChild("HumanoidRootPart") or d.PrimaryPart
-            if part then
-                local dist = (part.Position - root.Position).Magnitude
-                if dist < bestD then
-                    best = { model=d, part=part, kind=d:GetAttribute("BuyerKind"), dist=dist }
-                    bestD = dist
-                end
-            end
-        end
-    end
-    return best
-end
-
 local function inventoryCount()
     local counts = { durian=0, lump=0, palm=0 }
     local char = LP.Character
@@ -392,7 +372,12 @@ local function inventoryCount()
             for _, t in ipairs(c:GetChildren()) do
                 if t:IsA("Tool") then
                     if t:GetAttribute("FruitUid") then
-                        if t:GetAttribute("FruitId") == "OilPalm" then counts.palm = counts.palm + 1
+                        local fid = t:GetAttribute("FruitId")
+                        local isPalm = false
+                        if DurianConfig and DurianConfig.ById[fid] then
+                            isPalm = DurianConfig.ById[fid].Buyer == "Palm"
+                        end
+                        if isPalm then counts.palm = counts.palm + 1
                         else counts.durian = counts.durian + 1 end
                     elseif t:GetAttribute("ScrapUid") then
                         counts.lump = counts.lump + 1
@@ -404,6 +389,25 @@ local function inventoryCount()
     return counts
 end
 
+local function findBuyer(kind)
+    local _, root = getChar()
+    if not root then return end
+    local best, bestD = nil, Config.SellRange
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("Model") and d:GetAttribute("BuyerKind") == kind then
+            local part = d:FindFirstChild("HumanoidRootPart") or d:FindFirstChild("Head") or d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart")
+            if part then
+                local dist = (part.Position - root.Position).Magnitude
+                if dist < bestD then
+                    best = { model=d, part=part, kind=kind, dist=dist }
+                    bestD = dist
+                end
+            end
+        end
+    end
+    return best
+end
+
 local function trySell()
     local char, root = getChar()
     if not char or not root then Status.Sell = "NO CHAR" return false end
@@ -412,27 +416,30 @@ local function trySell()
     if (inv.durian + inv.lump + inv.palm) == 0 then Status.Sell = "NOTHING" return false end
     if not SellRemote then Status.Sell = "NO REMOTE" return false end
 
-    Status.Sell = "FINDING BUYER"
-    local buyer = findBuyer()
-    if not buyer then Status.Sell = "NO BUYER" return false end
+    local targetKind = nil
+    if inv.durian > 0 then targetKind = "Durian"
+    elseif inv.lump > 0 then targetKind = "Rubber"
+    elseif inv.palm > 0 then targetKind = "Palm" end
+    
+    local buyer = findBuyer(targetKind)
+    if not buyer then Status.Sell = "NO "..targetKind.." BUYER" return false end
 
-    if buyer.dist > 15 then
-        Status.Sell = "WARPING TO BUYER"
-        teleportTo(buyer.part.Position)
-        task.wait(0.3)
+    if buyer.dist > 18 then
+        Status.Sell = "WALKING TO "..targetKind
+        walkTo(buyer.part.Position)
+        return true
     end
 
     local mode
-    if inv.durian > 0 then mode = "All"
-    elseif inv.lump > 0 then mode = "LumpAll"
-    elseif inv.palm > 0 then mode = "PalmAll" end
-    if not mode then return false end
+    if targetKind == "Durian" then mode = "All"
+    elseif targetKind == "Rubber" then mode = "LumpAll"
+    elseif targetKind == "Palm" then mode = "PalmAll" end
 
     local ok = pcall(function() SellRemote:FireServer(mode) end)
     if ok then
         Stats.Sold = Stats.Sold + 1
-        Status.Sell = "SOLD (" .. mode .. ")"
-        task.wait(1.2)
+        Status.Sell = "SOLD (" .. targetKind .. ")"
+        task.wait(1.5)
     else
         Status.Sell = "FAILED"
     end
@@ -465,7 +472,7 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- UI
+-- UI & MINIMIZE SYSTEM
 -- ============================================================
 local function mk(parent, class, props)
     local o = Instance.new(class)
@@ -482,39 +489,78 @@ local gui = mk(PlayerGui, "ScreenGui", {
     DisplayOrder = 999,
 })
 
+local FULL_SIZE = UDim2.fromOffset(320, 520)
+local MINI_SIZE = UDim2.fromOffset(320, 36)
+
 local root = mk(gui, "Frame", {
     Name = "Main",
-    Size = UDim2.fromOffset(320, 520),
+    Size = FULL_SIZE,
     Position = UDim2.new(0, 20, 0, 80),
     BackgroundColor3 = Color3.fromRGB(22, 26, 32),
     BorderSizePixel = 0,
     Active = true,
+    ClipsDescendants = true -- สำคัญมาก: ทำให้ตอนย่อแล้วเนื้อหาข้างในถูกซ่อน
 })
 corner(root, 10)
 mk(root, "UIStroke", { Color = Color3.fromRGB(70, 100, 80), Thickness = 1.5 })
 
 local titleBar = mk(root, "Frame", {
+    Name = "TitleBar",
     Size = UDim2.new(1, 0, 0, 36),
     BackgroundColor3 = Color3.fromRGB(30, 38, 40),
     BorderSizePixel = 0,
 })
 corner(titleBar, 10)
 mk(titleBar, "TextLabel", {
-    Size = UDim2.new(1, -20, 1, 0),
+    Size = UDim2.new(1, -60, 1, 0),
     Position = UDim2.fromOffset(12, 0),
     BackgroundTransparency = 1,
-    Text = "🌾 Auto Farm V2 (Warp)",
+    Text = "🌾 Auto Farm V4",
     TextColor3 = Color3.fromRGB(0, 230, 150),
     TextSize = 15,
     Font = Enum.Font.GothamBold,
     TextXAlignment = Enum.TextXAlignment.Left,
 })
 
+-- ปุ่มย่อ UI (อยู่มุมขวา)
+local minimizeBtn = mk(titleBar, "TextButton", {
+    Size = UDim2.new(0, 24, 0, 24),
+    Position = UDim2.new(1, -32, 0, 6),
+    BackgroundColor3 = Color3.fromRGB(60, 70, 75),
+    Text = "-",
+    TextColor3 = Color3.new(1, 1, 1),
+    TextSize = 18,
+    Font = Enum.Font.GothamBold,
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+})
+corner(minimizeBtn, 4)
+
+local isMinimized = false
+minimizeBtn.MouseButton1Click:Connect(function()
+    isMinimized = not isMinimized
+    if isMinimized then
+        minimizeBtn.Text = "+"
+        TweenService:Create(root, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = MINI_SIZE}):Play()
+    else
+        minimizeBtn.Text = "-"
+        TweenService:Create(root, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = FULL_SIZE}):Play()
+    end
+end)
+
+-- Content Container (ใส่ทุกอย่างที่ไม่ใช่ TitleBar ไว้ในนี้)
+local content = mk(root, "Frame", {
+    Name = "Content",
+    Size = UDim2.new(1, 0, 1, -36),
+    Position = UDim2.fromOffset(0, 36),
+    BackgroundTransparency = 1,
+})
+
 local ROW_H  = 60
-local Y_START = 44
+local Y_START = 8
 
 local function makeToggleRow(key, label, color, yPos)
-    local row = mk(root, "Frame", {
+    local row = mk(content, "Frame", {
         Size = UDim2.new(1, -24, 0, ROW_H),
         Position = UDim2.fromOffset(12, yPos),
         BackgroundColor3 = Color3.fromRGB(32, 40, 46),
@@ -578,8 +624,8 @@ local _, statusW, statW = makeToggleRow("Water", "WATER", Color3.fromRGB(90, 190
 
 local Y_NEXT = Y_START + 3 * (ROW_H + 4) + 8
 
-local cfgBox = mk(root, "Frame", {
-    Size = UDim2.new(1, -24, 0, 130),
+local cfgBox = mk(content, "Frame", {
+    Size = UDim2.new(1, -24, 0, 145),
     Position = UDim2.fromOffset(12, Y_NEXT),
     BackgroundColor3 = Color3.fromRGB(28, 34, 40),
     BorderSizePixel = 0,
@@ -657,22 +703,29 @@ modeBtn.MouseButton1Click:Connect(function()
     modeBtn.Text = "Harvest: " .. Config.HarvestMode
 end)
 
-local tpBtn = mk(cfgBox, "TextButton", {
+local noclipBtn = mk(cfgBox, "TextButton", {
     Size = UDim2.new(0, 140, 0, 26),
     Position = UDim2.fromOffset(156, 44),
     BackgroundColor3 = Color3.fromRGB(50, 60, 55),
-    Text = "Warp: " .. (Config.Teleport and "ON" or "OFF"),
+    Text = "Noclip: " .. (Config.Noclip and "ON" or "OFF"),
     TextColor3 = Color3.new(1, 1, 1),
     TextSize = 12,
     Font = Enum.Font.Gotham,
     AutoButtonColor = false,
     BorderSizePixel = 0,
 })
-corner(tpBtn, 5)
-tpBtn.MouseButton1Click:Connect(function()
-    Config.Teleport = not Config.Teleport
-    tpBtn.Text = "Warp: " .. (Config.Teleport and "ON" or "OFF")
-    tpBtn.BackgroundColor3 = Config.Teleport and Color3.fromRGB(50, 60, 55) or Color3.fromRGB(70, 50, 50)
+corner(noclipBtn, 5)
+noclipBtn.MouseButton1Click:Connect(function()
+    Config.Noclip = not Config.Noclip
+    noclipBtn.Text = "Noclip: " .. (Config.Noclip and "ON" or "OFF")
+    noclipBtn.BackgroundColor3 = Config.Noclip and Color3.fromRGB(50, 60, 55) or Color3.fromRGB(70, 50, 50)
+    if not Config.Noclip then
+        if LP.Character then
+            for _, part in ipairs(LP.Character:GetDescendants()) do
+                if part:IsA("BasePart") then part.CanCollide = true end
+            end
+        end
+    end
 end)
 
 local purgeBtn = mk(cfgBox, "TextButton", {
@@ -710,9 +763,9 @@ rayBtn.MouseButton1Click:Connect(function()
     rayBtn.Text = "Ray: " .. (Config.ShowRay and "ON" or "OFF")
 end)
 
-local statsBox = mk(root, "Frame", {
+local statsBox = mk(content, "Frame", {
     Size = UDim2.new(1, -24, 0, 60),
-    Position = UDim2.fromOffset(12, Y_NEXT + 138),
+    Position = UDim2.fromOffset(12, Y_NEXT + 153),
     BackgroundColor3 = Color3.fromRGB(32, 38, 44),
     BorderSizePixel = 0,
 })
@@ -739,7 +792,7 @@ local statRuntime = mk(statsBox, "TextLabel", {
     TextXAlignment = Enum.TextXAlignment.Left,
 })
 
--- Drag
+-- Drag window
 local dragging, dragStart, startPos
 titleBar.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -760,6 +813,7 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
+-- Live update stats
 task.spawn(function()
     while gui.Parent do
         statusS.Text = "Sell: " .. Status.Sell
@@ -774,13 +828,15 @@ task.spawn(function()
     end
 end)
 
+-- Hotkey
 UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
     if input.KeyCode == Enum.KeyCode.F8 then
         local on = not (Config.Harvest or Config.Water or Config.Sell)
         Config.Harvest, Config.Water, Config.Sell = on, on, on
+        
         -- อัพเดท UI
-        for _, row in ipairs(root:GetChildren()) do
+        for _, row in ipairs(content:GetChildren()) do
             if row:IsA("Frame") and row.BackgroundColor3 == Color3.fromRGB(32, 40, 46) then
                 local btn = row:FindFirstChildWhichIsA("TextButton")
                 if btn then
@@ -797,4 +853,4 @@ UserInputService.InputBegan:Connect(function(input, gp)
     end
 end)
 
-print("[AutoFarm V2] โหลดเสร็จ — ระบบวาปพร้อมใช้งาน!")
+print("[AutoFarm V4] โหลดเสร็จ — เพิ่มระบบ Minimize UI แล้ว")
