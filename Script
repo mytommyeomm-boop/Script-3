@@ -1,8 +1,7 @@
 --[[ ============================================================
-    AUTO FARM SUITE  (Harvest + Water + Sell)
-    - ใช้ Remote ที่เกมมีให้ทั้งหมด (ปลอดภัยจาก CharacterSync)
-    - MoveTo ใช้ WalkSpeed ปกติ ไม่โดน anti-cheat
-    - Priority: Sell > Harvest > Water (ทำงานทีละอย่าง)
+    AUTO FARM SUITE V2 (Harvest + Water + Sell + Teleport)
+    - แก้ไขระบบ Harvest ให้ทำงานได้แม่นยำขึ้น (อิงตามปุ่มที่โชว์)
+    - เปลี่ยนระบบเดินเป็น "วาป" (Teleport) ทั้งหมด
 ============================================================ ]]
 
 local Players           = game:GetService("Players")
@@ -10,7 +9,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CollectionService = game:GetService("CollectionService")
 local UserInputService  = game:GetService("UserInputService")
 local TweenService      = game:GetService("TweenService")
-local RunService        = game:GetService("RunService")
 
 local LP        = Players.LocalPlayer
 local PlayerGui = LP:WaitForChild("PlayerGui")
@@ -21,15 +19,6 @@ local WaterRemote   = Remotes:WaitForChild("Water", 15)
 local SellRemote    = Remotes:WaitForChild("SellDurians", 15)
 local CatchCancel   = Remotes:FindFirstChild("CatchCancel")
 
--- Lazy-load config (สำหรับดู Buyer / FruitId)
-local DurianConfig
-pcall(function()
-    DurianConfig = require(ReplicatedStorage.Shared:WaitForChild("DurianConfig"))
-end)
-local function isPalm(fruitId)
-    return fruitId == "OilPalm"
-end
-
 -- ============================================================
 -- Config + State
 -- ============================================================
@@ -38,60 +27,26 @@ local Config = {
     Water       = false,
     Sell        = false,
 
-    HarvestRange = 22,     -- studs
-    WaterRange   = 30,     -- studs (ไกลสุดที่ยอมเดินไป)
-    SellRange    = 200,    -- studs ค้นหา buyer
+    HarvestRange = 35,     -- เพิ่มระยะให้กว้างขึ้น
+    WaterRange   = 50,     
+    SellRange    = 250,    
 
-    HarvestMode  = "Proximity", -- "Proximity" | "Aim"
+    HarvestMode  = "Proximity",
     AutoPurge    = false,
-    Walk         = true,   -- อนุญาต MoveTo
-    Cooldown     = 0.35,
+    Teleport     = true,   -- เปิดใช้งานวาป
+    Cooldown     = 0.4,
     ShowRay      = true,
 }
 
-local Status = {
-    Harvest = "IDLE",
-    Water   = "IDLE",
-    Sell    = "IDLE",
-}
-
-local Stats = {
-    Harvested = 0,
-    Watered   = 0,
-    Sold      = 0,
-    StartTime = tick(),
-}
-
+local Status = { Harvest = "IDLE", Water = "IDLE", Sell = "IDLE" }
+local Stats  = { Harvested = 0, Watered = 0, Sold = 0, StartTime = tick() }
 local Busy       = false
 local LastFire   = 0
-local wateredSet = setmetatable({}, { __mode = "k" }) -- PlantSpot ที่รดแล้ว
-local skipBuyer  = nil
-local skipTime   = 0
+local wateredSet = setmetatable({}, { __mode = "k" })
 
 -- ============================================================
--- Base helpers
+-- Helpers
 -- ============================================================
-local function getMyBase()
-    local map = workspace:FindFirstChild("Map")
-    local bases = map and map:FindFirstChild("Bases")
-    if not bases then return nil end
-    for _, b in ipairs(bases:GetChildren()) do
-        if b:GetAttribute("OwnerUserId") == LP.UserId then return b end
-    end
-    return nil
-end
-
-local function inMyBase(inst)
-    local base = getMyBase()
-    if not base or not inst then return false end
-    local cur = inst
-    while cur and cur ~= workspace do
-        if cur == base then return true end
-        cur = cur.Parent
-    end
-    return false
-end
-
 local function getChar()
     local c = LP.Character
     return c, c and c:FindFirstChild("HumanoidRootPart"), c and c:FindFirstChildOfClass("Humanoid")
@@ -103,51 +58,58 @@ local function freeHands()
     local hum = char:FindFirstChildOfClass("Humanoid")
     if hum and char:FindFirstChildOfClass("Tool") then
         pcall(function() hum:UnequipTools() end)
+        task.wait(0.15)
     end
 end
 
-local function walkTo(pos, timeout)
-    if not Config.Walk then return false end
+local function isPurgeNow()
+    local ok, cfg = pcall(require, ReplicatedStorage.Shared:WaitForChild("WorldClock"))
+    if not ok then return false end
+    local ok2, r = pcall(cfg.IsPurgeNow)
+    return ok2 and r or false
+end
+
+-- ระบบวาป
+local function teleportTo(pos)
     local char, root, hum = getChar()
-    if not root or not hum then return false end
-    timeout = timeout or 8
-    local t0 = tick()
-    while tick() - t0 < timeout do
-        if not root.Parent then return false end
-        if (root.Position - pos).Magnitude <= 4 then return true end
-        pcall(function() hum:MoveTo(pos) end)
-        task.wait(0.1)
+    if not root or not char then return false end
+    
+    if Config.Teleport then
+        -- วาปไปเหนือพื้นนิดหน่อยเพื่อกันจมพื้น
+        root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        task.wait(0.2)
+        return true
+    else
+        -- เดินปกติ (Fallback)
+        local t0 = tick()
+        while tick() - t0 < 5 do
+            if not root.Parent then return false end
+            if (root.Position - pos).Magnitude <= 5 then return true end
+            pcall(function() hum:MoveTo(pos) end)
+            task.wait(0.1)
+        end
+        return false
     end
-    return false
 end
 
--- Ray visual
-local rayPart
 local function showRay(from, to, color)
-    if not Config.ShowRay then
-        if rayPart then rayPart.Transparency = 1 end
-        return
-    end
-    if not rayPart or not rayPart.Parent then
-        rayPart = Instance.new("Part")
-        rayPart.Name = "AutoFarmRay"
-        rayPart.Anchored = true
-        rayPart.CanCollide = false
-        rayPart.CanQuery = false
-        rayPart.CanTouch = false
-        rayPart.CastShadow = false
-        rayPart.Material = Enum.Material.Neon
-        rayPart.Size = Vector3.new(0.1, 0.1, 1)
-        rayPart.Parent = workspace
-    end
-    rayPart.Color = color or Color3.fromRGB(0, 255, 140)
+    if not Config.ShowRay then return end
     local dir = to - from
     local len = dir.Magnitude
-    if len < 0.2 then rayPart.Transparency = 1 return end
+    if len < 0.2 then return end
     local mid = from + dir * 0.5
-    rayPart.CFrame = CFrame.lookAt(mid, mid + dir.Unit)
-    rayPart.Size = Vector3.new(0.1, 0.1, len)
-    rayPart.Transparency = 0.55
+    -- สร้างชั่วคราวเพื่อไม่ให้ค้าง
+    local p = Instance.new("Part")
+    p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+    p.CastShadow, p.Material = false, Enum.Material.Neon
+    p.Color = color or Color3.fromRGB(0, 255, 140)
+    p.Size = Vector3.new(0.1, 0.1, len)
+    p.CFrame = CFrame.lookAt(mid, mid + dir.Unit)
+    p.Transparency = 0.5
+    p.Parent = workspace
+    TweenService:Create(p, TweenInfo.new(0.5), {Transparency = 1}):Play()
+    game:GetService("Debris"):AddItem(p, 0.6)
 end
 
 -- ============================================================
@@ -167,23 +129,11 @@ local function canHarvest(fruit)
     local prompt = findPrompt(fruit)
     if not prompt or not prompt.Enabled then return false end
 
+    -- ไม่เช็คฐานแล้ว ให้ยึดตามปุ่มที่โชว์เป็นหลัก
     local unripe = prompt:GetAttribute("Unripe")
-    local mine = inMyBase(fruit)
+    if unripe and not Config.AutoPurge then return false end
 
-    if unripe then
-        if not (Config.AutoPurge and isPurgeNow()) then return false end
-        if mine then return false end
-    else
-        if not mine and not (Config.AutoPurge and isPurgeNow()) then return false end
-    end
     return true, prompt, part
-end
-
-local function isPurgeNow()
-    local ok, cfg = pcall(require, ReplicatedStorage.Shared:WaitForChild("WorldClock"))
-    if not ok then return false end
-    local ok2, r = pcall(cfg.IsPurgeNow)
-    return ok2 and r or false
 end
 
 local function findHarvestProximity()
@@ -239,13 +189,12 @@ end
 local function fireHarvest(target)
     local char = getChar()
     if not char then return false end
-    freeHands()
-    task.wait(0.05)
-
+    
+    freeHands() -- วางของในมือก่อน
+    
     local ok = pcall(function() HarvestRemote:FireServer(target.prompt) end)
     if not ok then return false end
 
-    -- รอ CatchStart
     local t0 = tick()
     local started = false
     while tick() - t0 < 3 do
@@ -255,7 +204,6 @@ local function fireHarvest(target)
     end
     if not started then return false end
 
-    -- รอจนจบ
     t0 = tick()
     while char.Parent and char:GetAttribute("CatchStart") and (tick() - t0) < 10 do
         task.wait(0.1)
@@ -277,8 +225,17 @@ local function tryHarvest()
     local target = Config.HarvestMode == "Aim" and findHarvestAim() or findHarvestProximity()
     if not target then Status.Harvest = "NO TARGET" return false end
 
+    -- ถ้าไกลเกิน 15 วาปไปหาเลย
+    if Config.Teleport and target.dist > 15 then
+        Status.Harvest = "WARPING TO FRUIT"
+        local safePos = target.part.Position + Vector3.new(0, 0, 0)
+        teleportTo(safePos)
+        task.wait(0.2)
+    end
+
     showRay(root.Position + Vector3.new(0, 2, 0), target.part.Position, Color3.fromRGB(0, 255, 140))
     Status.Harvest = "HARVESTING"
+    
     local ok = fireHarvest(target)
     if ok then
         Stats.Harvested = Stats.Harvested + 1
@@ -290,7 +247,7 @@ local function tryHarvest()
 end
 
 -- ============================================================
--- WATER
+-- WATER (วาป)
 -- ============================================================
 local function findWateringCan()
     local char = LP.Character
@@ -298,25 +255,21 @@ local function findWateringCan()
     for _, c in ipairs({ char, bp }) do
         if c then
             for _, t in ipairs(c:GetChildren()) do
-                if t:IsA("Tool") and t:GetAttribute("GearId") == "WateringCan" then
-                    return t
-                end
+                if t:IsA("Tool") and t:GetAttribute("GearId") == "WateringCan" then return t end
             end
         end
     end
 end
 
 local function findWell()
-    local base = getMyBase()
-    if not base then return end
-    for _, name in ipairs({ "Well", "WaterWell", "WaterWellModel", "BuyPad_Well" }) do
-        for _, d in ipairs(base:GetDescendants()) do
-            if d.Name == name and d:IsA("BasePart") then return d.Position end
-        end
-    end
-    for _, d in ipairs(base:GetDescendants()) do
-        if d:IsA("BasePart") and d.Name:lower():find("well") then
-            return d.Position
+    local map = workspace:FindFirstChild("Map")
+    local bases = map and map:FindFirstChild("Bases")
+    if not bases then return end
+    for _, b in ipairs(bases:GetChildren()) do
+        if b:GetAttribute("OwnerUserId") == LP.UserId then
+            for _, d in ipairs(b:GetDescendants()) do
+                if d:IsA("BasePart") and d.Name:lower():find("well") then return d.Position end
+            end
         end
     end
 end
@@ -324,19 +277,23 @@ end
 local function findWaterTarget()
     local _, root = getChar()
     if not root then return end
-
-    local base = getMyBase()
-    if not base then return end
+    local map = workspace:FindFirstChild("Map")
+    local bases = map and map:FindFirstChild("Bases")
+    if not bases then return end
 
     local best, bestD = nil, Config.WaterRange
-    for _, d in ipairs(base:GetDescendants()) do
-        if d.Name == "PlantSpot" and d:IsA("BasePart") and not wateredSet[d] then
-            local parent = d.Parent
-            if parent and (parent:FindFirstChild("Tree") or parent:FindFirstChild("Seed")) then
-                local dist = (d.Position - root.Position).Magnitude
-                if dist < bestD then
-                    best = d
-                    bestD = dist
+    for _, b in ipairs(bases:GetChildren()) do
+        if b:GetAttribute("OwnerUserId") == LP.UserId then
+            for _, d in ipairs(b:GetDescendants()) do
+                if d.Name == "PlantSpot" and d:IsA("BasePart") and not wateredSet[d] then
+                    local parent = d.Parent
+                    if parent and (parent:FindFirstChild("Tree") or parent:FindFirstChild("Seed")) then
+                        local dist = (d.Position - root.Position).Magnitude
+                        if dist < bestD then
+                            best = d
+                            bestD = dist
+                        end
+                    end
                 end
             end
         end
@@ -348,59 +305,50 @@ local function tryWater()
     local char, root = getChar()
     if not char or not root then Status.Water = "NO CHAR" return false end
 
-    -- ต้องมี watering can
     local can = findWateringCan()
     if not can then Status.Water = "NO CAN" return false end
 
-    -- ถือ can
     local curTool = char:FindFirstChildOfClass("Tool")
     if curTool ~= can then
         local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then
-            pcall(function() hum:EquipTool(can) end)
-            task.wait(0.1)
-        end
+        if hum then pcall(function() hum:EquipTool(can) end) task.wait(0.1) end
     end
 
-    -- น้ำหมด → เติม
     local uses = LP:GetAttribute("WaterUses") or 0
     if uses <= 0 then
         local wellPos = findWell()
-        if not wellPos then
-            Status.Water = "NO WELL FOUND"
-            return false
+        if not wellPos then Status.Water = "NO WELL FOUND" return false end
+        
+        if Config.Teleport then
+            Status.Water = "WARPING TO WELL"
+            teleportTo(wellPos)
+        else
+            if (root.Position - wellPos).Magnitude > 10 then
+                Status.Water = "WALK TO WELL"
+                teleportTo(wellPos) -- Fallback เดิน
+                return true
+            end
         end
-        local dist = (root.Position - wellPos).Magnitude
-        if dist > 10 then
-            Status.Water = "WALK TO WELL"
-            walkTo(wellPos)
-            return true
-        end
+        
         WaterRemote:FireServer("Water", char:GetPivot().Position)
         Status.Water = "REFILLING"
         task.wait(1.2)
         return true
     end
 
-    -- หาเป้ารดน้ำ
     local target, dist = findWaterTarget()
-    if not target then
-        Status.Water = "ALL DONE"
-        return false
-    end
+    if not target then Status.Water = "ALL DONE" return false end
 
     if dist > 10 then
-        Status.Water = "WALKING"
-        showRay(root.Position + Vector3.new(0, 2, 0), target.Position, Color3.fromRGB(90, 190, 255))
-        walkTo(target.Position)
-        return true
+        Status.Water = "WARPING TO PLANT"
+        teleportTo(target.Position)
+        task.wait(0.2)
     end
 
-    -- รดน้ำ
     local usesBefore = LP:GetAttribute("WaterUses") or 0
     WaterRemote:FireServer("Water", target.Position)
     showRay(root.Position + Vector3.new(0, 2, 0), target.Position, Color3.fromRGB(90, 190, 255))
-    task.wait(0.7)
+    task.wait(0.8)
     local usesAfter = LP:GetAttribute("WaterUses") or 0
 
     wateredSet[target] = true
@@ -414,24 +362,20 @@ local function tryWater()
 end
 
 -- ============================================================
--- SELL
+-- SELL (วาป)
 -- ============================================================
 local function findBuyer()
     local _, root = getChar()
     if not root then return end
-
     local best, bestD = nil, Config.SellRange
     for _, d in ipairs(workspace:GetDescendants()) do
-        if d:IsA("Model") then
-            local kind = d:GetAttribute("BuyerKind")
-            if kind and (kind == "Durian" or kind == "Rubber" or kind == "Palm") then
-                local part = d:FindFirstChild("HumanoidRootPart") or d.PrimaryPart
-                if part then
-                    local dist = (part.Position - root.Position).Magnitude
-                    if dist < bestD then
-                        best = { model=d, part=part, kind=kind, dist=dist }
-                        bestD = dist
-                    end
+        if d:IsA("Model") and d:GetAttribute("BuyerKind") then
+            local part = d:FindFirstChild("HumanoidRootPart") or d.PrimaryPart
+            if part then
+                local dist = (part.Position - root.Position).Magnitude
+                if dist < bestD then
+                    best = { model=d, part=part, kind=d:GetAttribute("BuyerKind"), dist=dist }
+                    bestD = dist
                 end
             end
         end
@@ -448,12 +392,8 @@ local function inventoryCount()
             for _, t in ipairs(c:GetChildren()) do
                 if t:IsA("Tool") then
                     if t:GetAttribute("FruitUid") then
-                        local fid = t:GetAttribute("FruitId")
-                        if isPalm(fid) then
-                            counts.palm = counts.palm + 1
-                        else
-                            counts.durian = counts.durian + 1
-                        end
+                        if t:GetAttribute("FruitId") == "OilPalm" then counts.palm = counts.palm + 1
+                        else counts.durian = counts.durian + 1 end
                     elseif t:GetAttribute("ScrapUid") then
                         counts.lump = counts.lump + 1
                     end
@@ -469,32 +409,23 @@ local function trySell()
     if not char or not root then Status.Sell = "NO CHAR" return false end
 
     local inv = inventoryCount()
-    local total = inv.durian + inv.lump + inv.palm
-    if total == 0 then Status.Sell = "NOTHING" return false end
-
+    if (inv.durian + inv.lump + inv.palm) == 0 then Status.Sell = "NOTHING" return false end
     if not SellRemote then Status.Sell = "NO REMOTE" return false end
 
     Status.Sell = "FINDING BUYER"
     local buyer = findBuyer()
     if not buyer then Status.Sell = "NO BUYER" return false end
 
-    -- ถ้าไกล ให้เดินไป
     if buyer.dist > 15 then
-        Status.Sell = "WALK TO " .. buyer.kind
-        showRay(root.Position + Vector3.new(0, 2, 0), buyer.part.Position, Color3.fromRGB(255, 210, 90))
-        walkTo(buyer.part.Position)
-        return true
+        Status.Sell = "WARPING TO BUYER"
+        teleportTo(buyer.part.Position)
+        task.wait(0.3)
     end
 
-    -- ขายตามชนิดที่มี (ให้ server กรองเอง)
     local mode
-    if inv.durian > 0 then
-        mode = "All"
-    elseif inv.lump > 0 then
-        mode = "LumpAll"
-    elseif inv.palm > 0 then
-        mode = "PalmAll"
-    end
+    if inv.durian > 0 then mode = "All"
+    elseif inv.lump > 0 then mode = "LumpAll"
+    elseif inv.palm > 0 then mode = "PalmAll" end
     if not mode then return false end
 
     local ok = pcall(function() SellRemote:FireServer(mode) end)
@@ -509,7 +440,7 @@ local function trySell()
 end
 
 -- ============================================================
--- MAIN LOOP — priority: Sell > Harvest > Water
+-- MAIN LOOP
 -- ============================================================
 task.spawn(function()
     while true do
@@ -517,40 +448,15 @@ task.spawn(function()
             local anyOn = Config.Sell or Config.Harvest or Config.Water
             if anyOn and (tick() - LastFire) >= Config.Cooldown then
                 local did = false
-
-                if Config.Sell then
-                    Busy = true
-                    did = trySell()
-                    if did then LastFire = tick() end
-                    Busy = false
-                end
-
-                if not did and Config.Harvest then
-                    Busy = true
-                    did = tryHarvest()
-                    if did then LastFire = tick() end
-                    Busy = false
-                end
-
-                if not did and Config.Water then
-                    Busy = true
-                    did = tryWater()
-                    if did then LastFire = tick() end
-                    Busy = false
-                end
-
-                if not did then
-                    if Config.Sell    then Status.Sell = Status.Sell ~= "" and Status.Sell or "IDLE" end
-                    if Config.Harvest then Status.Harvest = "IDLE" end
-                    if Config.Water   then Status.Water = "IDLE" end
-                end
+                if Config.Sell then Busy = true did = trySell() if did then LastFire = tick() end Busy = false end
+                if not did and Config.Harvest then Busy = true did = tryHarvest() if did then LastFire = tick() end Busy = false end
+                if not did and Config.Water then Busy = true did = tryWater() if did then LastFire = tick() end Busy = false end
             end
         end
         task.wait(0.08)
     end
 end)
 
--- reset wateredSet ทุก 3 นาที
 task.spawn(function()
     while true do
         task.wait(180)
@@ -578,7 +484,7 @@ local gui = mk(PlayerGui, "ScreenGui", {
 
 local root = mk(gui, "Frame", {
     Name = "Main",
-    Size = UDim2.fromOffset(320, 500),
+    Size = UDim2.fromOffset(320, 520),
     Position = UDim2.new(0, 20, 0, 80),
     BackgroundColor3 = Color3.fromRGB(22, 26, 32),
     BorderSizePixel = 0,
@@ -587,7 +493,6 @@ local root = mk(gui, "Frame", {
 corner(root, 10)
 mk(root, "UIStroke", { Color = Color3.fromRGB(70, 100, 80), Thickness = 1.5 })
 
--- Title bar
 local titleBar = mk(root, "Frame", {
     Size = UDim2.new(1, 0, 0, 36),
     BackgroundColor3 = Color3.fromRGB(30, 38, 40),
@@ -598,23 +503,20 @@ mk(titleBar, "TextLabel", {
     Size = UDim2.new(1, -20, 1, 0),
     Position = UDim2.fromOffset(12, 0),
     BackgroundTransparency = 1,
-    Text = "🌾 Auto Farm Suite",
+    Text = "🌾 Auto Farm V2 (Warp)",
     TextColor3 = Color3.fromRGB(0, 230, 150),
     TextSize = 15,
     Font = Enum.Font.GothamBold,
     TextXAlignment = Enum.TextXAlignment.Left,
 })
 
--- ============================================================
--- 3 Toggle rows (Sell / Harvest / Water)
--- ============================================================
 local ROW_H  = 60
 local Y_START = 44
 
-local function makeToggleRow(key, label, color)
+local function makeToggleRow(key, label, color, yPos)
     local row = mk(root, "Frame", {
         Size = UDim2.new(1, -24, 0, ROW_H),
-        Position = UDim2.fromOffset(12, Y_START),
+        Position = UDim2.fromOffset(12, yPos),
         BackgroundColor3 = Color3.fromRGB(32, 40, 46),
         BorderSizePixel = 0,
     })
@@ -667,52 +569,15 @@ local function makeToggleRow(key, label, color)
         end
     end)
 
-    return row, statusLbl, statLbl, btn
+    return row, statusLbl, statLbl
 end
 
-local _, statusH, statH = makeToggleRow("Harvest", "HARVEST", Color3.fromRGB(0, 230, 150))
-local _, statusS, statS = makeToggleRow("Sell",    "SELL",    Color3.fromRGB(255, 210, 90))
-local _, statusW, statW = makeToggleRow("Water",   "WATER",   Color3.fromRGB(90, 190, 255))
--- ↑ ทั้ง 3 rows ใช้ Position เริ่ม Y_START เดียวกัน แล้ว offset ทีละ row
-local function repositionRows()
-    local i = 0
-    for _, row in ipairs(root:GetChildren()) do
-        if row:IsA("Frame") and row.BackgroundColor3 == Color3.fromRGB(32, 40, 46) then
-            row.Position = UDim2.fromOffset(12, Y_START + i * (ROW_H + 4))
-            i = i + 1
-        end
-    end
-    return i
-end
-
--- สร้าง rows ใหม่ให้ position ถูกต้อง — ลบที่สร้างเกินทิ้งก่อน
-local rows = {}
-do
-    -- ลบที่ makeToggleRow สร้างไป 3 อัน (เพราะ Position ผิด)
-    local removed = {}
-    for _, c in ipairs(root:GetChildren()) do
-        if c:IsA("Frame") and c.BackgroundColor3 == Color3.fromRGB(32, 40, 46) then
-            table.insert(removed, c)
-        end
-    end
-    for _, c in ipairs(removed) do c:Destroy() end
-    -- สร้างใหม่
-    local r1, h1, hs1 = makeToggleRow("Sell",    "SELL",    Color3.fromRGB(255, 210, 90))
-    r1.Position = UDim2.fromOffset(12, Y_START)
-    local r2, h2, hs2 = makeToggleRow("Harvest", "HARVEST", Color3.fromRGB(0, 230, 150))
-    r2.Position = UDim2.fromOffset(12, Y_START + (ROW_H + 4))
-    local r3, h3, hs3 = makeToggleRow("Water",   "WATER",   Color3.fromRGB(90, 190, 255))
-    r3.Position = UDim2.fromOffset(12, Y_START + 2 * (ROW_H + 4))
-    statusH, statH = h2, hs2
-    statusS, statS = h1, hs1
-    statusW, statW = h3, hs3
-end
+local _, statusS, statS = makeToggleRow("Sell", "SELL", Color3.fromRGB(255, 210, 90), Y_START)
+local _, statusH, statH = makeToggleRow("Harvest", "HARVEST", Color3.fromRGB(0, 230, 150), Y_START + (ROW_H + 4))
+local _, statusW, statW = makeToggleRow("Water", "WATER", Color3.fromRGB(90, 190, 255), Y_START + 2 * (ROW_H + 4))
 
 local Y_NEXT = Y_START + 3 * (ROW_H + 4) + 8
 
--- ============================================================
--- Config row: Range slider
--- ============================================================
 local cfgBox = mk(root, "Frame", {
     Size = UDim2.new(1, -24, 0, 130),
     Position = UDim2.fromOffset(12, Y_NEXT),
@@ -725,7 +590,7 @@ local rangeLbl = mk(cfgBox, "TextLabel", {
     Size = UDim2.new(1, -16, 0, 18),
     Position = UDim2.fromOffset(8, 4),
     BackgroundTransparency = 1,
-    Text = "Harvest Range: 22 studs",
+    Text = "Harvest Range: " .. Config.HarvestRange .. " studs",
     TextColor3 = Color3.fromRGB(200, 210, 220),
     TextSize = 12,
     Font = Enum.Font.Gotham,
@@ -747,13 +612,12 @@ local rangeFill = mk(rangeTrack, "Frame", {
 corner(rangeFill, 3)
 
 local function setRangeFromX(x)
-    local ap = rangeTrack.AbsolutePosition
-    local as = rangeTrack.AbsoluteSize
+    local ap, as = rangeTrack.AbsolutePosition, rangeTrack.AbsoluteSize
     if as.X <= 0 then return end
     local t = math.clamp((x - ap.X) / as.X, 0, 1)
     local v = math.floor(5 + t * 45)
     Config.HarvestRange = v
-    Config.WaterRange   = v + 10
+    Config.WaterRange = v + 10
     rangeLbl.Text = "Harvest Range: " .. v .. " studs"
     rangeFill.Size = UDim2.new(t, 0, 1, 0)
 end
@@ -776,12 +640,11 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
--- Mode button (Harvest)
 local modeBtn = mk(cfgBox, "TextButton", {
     Size = UDim2.new(0, 140, 0, 26),
     Position = UDim2.fromOffset(8, 44),
     BackgroundColor3 = Color3.fromRGB(50, 55, 65),
-    Text = "Harvest: Proximity",
+    Text = "Harvest: " .. Config.HarvestMode,
     TextColor3 = Color3.new(1, 1, 1),
     TextSize = 12,
     Font = Enum.Font.Gotham,
@@ -790,40 +653,33 @@ local modeBtn = mk(cfgBox, "TextButton", {
 })
 corner(modeBtn, 5)
 modeBtn.MouseButton1Click:Connect(function()
-    if Config.HarvestMode == "Proximity" then
-        Config.HarvestMode = "Aim"
-        modeBtn.Text = "Harvest: Aim"
-    else
-        Config.HarvestMode = "Proximity"
-        modeBtn.Text = "Harvest: Proximity"
-    end
+    Config.HarvestMode = Config.HarvestMode == "Proximity" and "Aim" or "Proximity"
+    modeBtn.Text = "Harvest: " .. Config.HarvestMode
 end)
 
--- Walk toggle
-local walkBtn = mk(cfgBox, "TextButton", {
+local tpBtn = mk(cfgBox, "TextButton", {
     Size = UDim2.new(0, 140, 0, 26),
     Position = UDim2.fromOffset(156, 44),
     BackgroundColor3 = Color3.fromRGB(50, 60, 55),
-    Text = "Walk: ON",
+    Text = "Warp: " .. (Config.Teleport and "ON" or "OFF"),
     TextColor3 = Color3.new(1, 1, 1),
     TextSize = 12,
     Font = Enum.Font.Gotham,
     AutoButtonColor = false,
     BorderSizePixel = 0,
 })
-corner(walkBtn, 5)
-walkBtn.MouseButton1Click:Connect(function()
-    Config.Walk = not Config.Walk
-    walkBtn.Text = "Walk: " .. (Config.Walk and "ON" or "OFF")
-    walkBtn.BackgroundColor3 = Config.Walk and Color3.fromRGB(50, 60, 55) or Color3.fromRGB(70, 50, 50)
+corner(tpBtn, 5)
+tpBtn.MouseButton1Click:Connect(function()
+    Config.Teleport = not Config.Teleport
+    tpBtn.Text = "Warp: " .. (Config.Teleport and "ON" or "OFF")
+    tpBtn.BackgroundColor3 = Config.Teleport and Color3.fromRGB(50, 60, 55) or Color3.fromRGB(70, 50, 50)
 end)
 
--- Purge toggle
 local purgeBtn = mk(cfgBox, "TextButton", {
     Size = UDim2.new(0, 140, 0, 26),
     Position = UDim2.fromOffset(8, 76),
     BackgroundColor3 = Color3.fromRGB(50, 55, 65),
-    Text = "Purge: OFF",
+    Text = "Purge: " .. (Config.AutoPurge and "ON" or "OFF"),
     TextColor3 = Color3.new(1, 1, 1),
     TextSize = 12,
     Font = Enum.Font.Gotham,
@@ -837,12 +693,11 @@ purgeBtn.MouseButton1Click:Connect(function()
     purgeBtn.BackgroundColor3 = Config.AutoPurge and Color3.fromRGB(120, 40, 40) or Color3.fromRGB(50, 55, 65)
 end)
 
--- ShowRay toggle
 local rayBtn = mk(cfgBox, "TextButton", {
     Size = UDim2.new(0, 140, 0, 26),
     Position = UDim2.fromOffset(156, 76),
     BackgroundColor3 = Color3.fromRGB(50, 60, 55),
-    Text = "Ray: ON",
+    Text = "Ray: " .. (Config.ShowRay and "ON" or "OFF"),
     TextColor3 = Color3.new(1, 1, 1),
     TextSize = 12,
     Font = Enum.Font.Gotham,
@@ -853,12 +708,8 @@ corner(rayBtn, 5)
 rayBtn.MouseButton1Click:Connect(function()
     Config.ShowRay = not Config.ShowRay
     rayBtn.Text = "Ray: " .. (Config.ShowRay and "ON" or "OFF")
-    if not Config.ShowRay and rayPart then rayPart.Transparency = 1 end
 end)
 
--- ============================================================
--- Stats
--- ============================================================
 local statsBox = mk(root, "Frame", {
     Size = UDim2.new(1, -24, 0, 60),
     Position = UDim2.fromOffset(12, Y_NEXT + 138),
@@ -888,9 +739,7 @@ local statRuntime = mk(statsBox, "TextLabel", {
     TextXAlignment = Enum.TextXAlignment.Left,
 })
 
--- ============================================================
--- Drag window
--- ============================================================
+-- Drag
 local dragging, dragStart, startPos
 titleBar.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -902,8 +751,7 @@ end)
 UserInputService.InputChanged:Connect(function(input)
     if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
         local d = input.Position - dragStart
-        root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
-                                  startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
     end
 end)
 UserInputService.InputEnded:Connect(function(input)
@@ -912,44 +760,36 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
--- ============================================================
--- Live UI update
--- ============================================================
 task.spawn(function()
     while gui.Parent do
-        statusS.Text = "Sell:    " .. Status.Sell
+        statusS.Text = "Sell: " .. Status.Sell
         statusH.Text = "Harvest: " .. Status.Harvest
-        statusW.Text = "Water:   " .. Status.Water
-
-        statS.Text = "  Sold runs: " .. Stats.Sold
-        statH.Text = "  Harvested: " .. Stats.Harvested
-        statW.Text = "  Watered: " .. Stats.Watered
-
-        statTotal.Text = string.format("✓ %d  💧 %d  💰 %d",
-            Stats.Harvested, Stats.Watered, Stats.Sold)
+        statusW.Text = "Water: " .. Status.Water
+        statS.Text = "Sold runs: " .. Stats.Sold
+        statH.Text = "Harvested: " .. Stats.Harvested
+        statW.Text = "Watered: " .. Stats.Watered
+        statTotal.Text = string.format("✓ %d  💧 %d  💰 %d", Stats.Harvested, Stats.Watered, Stats.Sold)
         statRuntime.Text = "Runtime: " .. math.floor(tick() - Stats.StartTime) .. "s"
         task.wait(0.25)
     end
 end)
 
--- Hotkey F8 = toggle all on/off
 UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
     if input.KeyCode == Enum.KeyCode.F8 then
         local on = not (Config.Harvest or Config.Water or Config.Sell)
         Config.Harvest, Config.Water, Config.Sell = on, on, on
+        -- อัพเดท UI
         for _, row in ipairs(root:GetChildren()) do
             if row:IsA("Frame") and row.BackgroundColor3 == Color3.fromRGB(32, 40, 46) then
                 local btn = row:FindFirstChildWhichIsA("TextButton")
                 if btn then
                     if on then
                         btn.BackgroundColor3 = Color3.fromRGB(190, 50, 50)
-                        local t = btn.Text
-                        if t:sub(1, 1) ~= "■" then btn.Text = "■ " .. t:sub(3) end
+                        if btn.Text:sub(1, 1) ~= "■" then btn.Text = "■ " .. btn.Text:sub(3) end
                     else
                         btn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
-                        local t = btn.Text
-                        if t:sub(1, 1) ~= "▶" then btn.Text = "▶ " .. t:sub(3) end
+                        if btn.Text:sub(1, 1) ~= "▶" then btn.Text = "▶ " .. btn.Text:sub(3) end
                     end
                 end
             end
@@ -957,7 +797,4 @@ UserInputService.InputBegan:Connect(function(input, gp)
     end
 end)
 
-print("[AutoFarm Suite] โหลดเสร็จ — กด F8 toggle ทั้งหมด")
-print("  HARVEST: ใช้ HarvestFruit:FireServer(prompt)")
-print("  WATER:   ใช้ Water:FireServer('Water', pos) + WaterUses attribute")
-print("  SELL:    ใช้ SellDurians:FireServer('All'/'LumpAll'/'PalmAll')")
+print("[AutoFarm V2] โหลดเสร็จ — ระบบวาปพร้อมใช้งาน!")
