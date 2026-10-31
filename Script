@@ -1,5 +1,5 @@
 --[[ ============================================================
-    AUTO FARM V4 (Walk + Noclip + Fixed Sell + Minimize UI)
+    AUTO FARM V5 (Fixed Water + Fixed Harvest + Mobile Support + Minimize UI)
 ============================================================ ]]
 
 local Players           = game:GetService("Players")
@@ -68,17 +68,10 @@ local function freeHands()
     end
 end
 
-local function isPurgeNow()
-    local ok, cfg = pcall(require, ReplicatedStorage.Shared:WaitForChild("WorldClock"))
-    if not ok then return false end
-    local ok2, r = pcall(cfg.IsPurgeNow)
-    return ok2 and r or false
-end
-
 local function walkTo(pos, timeout)
     local char, root, hum = getChar()
     if not root or not hum then return false end
-    timeout = timeout or 12
+    timeout = timeout or 10
     local t0 = tick()
     while tick() - t0 < timeout do
         if not root.Parent then return false end
@@ -123,7 +116,7 @@ RunService.Stepped:Connect(function()
 end)
 
 -- ============================================================
--- HARVEST
+-- HARVEST (แก้ไขให้เดินใกล้ก่อนเก็บ)
 -- ============================================================
 local function findPrompt(fruit)
     for _, d in ipairs(fruit:GetDescendants()) do
@@ -197,10 +190,15 @@ end
 local function fireHarvest(target)
     local char = getChar()
     if not char then return false end
+    
+    -- วางของในมือก่อนเสมอ
     freeHands() 
+    
+    -- ยิง Prompt
     local ok = pcall(function() HarvestRemote:FireServer(target.prompt) end)
     if not ok then return false end
 
+    -- รอให้เซิร์ฟเวอร์ตอบกลับ (CatchStart)
     local t0 = tick()
     local started = false
     while tick() - t0 < 3 do
@@ -210,6 +208,7 @@ local function fireHarvest(target)
     end
     if not started then return false end
 
+    -- รอจนกว่าจะจับเสร็จ
     t0 = tick()
     while char.Parent and char:GetAttribute("CatchStart") and (tick() - t0) < 10 do
         task.wait(0.1)
@@ -231,7 +230,8 @@ local function tryHarvest()
     local target = Config.HarvestMode == "Aim" and findHarvestAim() or findHarvestProximity()
     if not target then Status.Harvest = "NO TARGET" return false end
 
-    if target.dist > 15 then
+    -- ถ้าระยะไกลเกิน 10 ให้เดินเข้าไปใกล้ก่อน
+    if target.dist > 10 then
         Status.Harvest = "WALKING TO FRUIT"
         walkTo(target.part.Position)
         return true
@@ -250,7 +250,7 @@ local function tryHarvest()
 end
 
 -- ============================================================
--- WATER
+-- WATER (แก้ไขระบบรดน้ำ)
 -- ============================================================
 local function findWateringCan()
     local char = LP.Character
@@ -276,9 +276,15 @@ end
 local function findWell()
     local base = getMyBase()
     if not base then return end
+    -- ค้นหาบ่อน้ำจากชื่อที่หลากหลายขึ้น
     for _, d in ipairs(base:GetDescendants()) do
-        if d:IsA("BasePart") and (d.Name == "BuyPad_Well" or d.Name:lower():find("well")) then
-            return d.Position
+        if d:IsA("BasePart") then
+            local name = d.Name:lower()
+            if name:find("well") or name:find("water") or name:find("barrel") then
+                if d.Size.Y < 25 then -- กันหลังคาหรือกำแพง
+                    return d.Position
+                end
+            end
         end
     end
 end
@@ -290,14 +296,18 @@ local function findWaterTarget()
     if not base then return end
 
     local best, bestD = nil, Config.WaterRange
-    for _, d in ipairs(base:GetDescendants()) do
-        if d.Name == "PlantSpot" and d:IsA("BasePart") and not wateredSet[d] then
-            local parent = d.Parent
-            if parent and (parent:FindFirstChild("Tree") or parent:FindFirstChild("Seed")) then
-                local dist = (d.Position - root.Position).Magnitude
-                if dist < bestD then
-                    best = d
-                    bestD = dist
+    for _, slot in ipairs(base:GetDescendants()) do
+        -- ในเกม PlantSpot มักจะซ่อนอยู่ใน Model (Slot) ไม่ใช่ BasePart ตรงๆ
+        if slot:IsA("Model") then
+            local plantSpot = slot:FindFirstChild("PlantSpot")
+            -- ต้องมั่นใจว่าเป็น BasePart และมีต้นไม้หรือเมล็ดพันธุ์อยู่
+            if plantSpot and plantSpot:IsA("BasePart") and not wateredSet[plantSpot] then
+                if slot:FindFirstChild("Tree") or slot:FindFirstChild("Seed") then
+                    local dist = (plantSpot.Position - root.Position).Magnitude
+                    if dist < bestD then
+                        best = plantSpot
+                        bestD = dist
+                    end
                 end
             end
         end
@@ -312,12 +322,14 @@ local function tryWater()
     local can = findWateringCan()
     if not can then Status.Water = "NO CAN" return false end
 
+    -- ถือบัวรดน้ำ
     local curTool = char:FindFirstChildOfClass("Tool")
     if curTool ~= can then
         local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then pcall(function() hum:EquipTool(can) end) task.wait(0.1) end
+        if hum then pcall(function() hum:EquipTool(can) end) task.wait(0.2) end
     end
 
+    -- เช็คน้ำในตัวละคร (ถ้ามีน้ำอยู่แล้ว ข้ามไปรดเลย)
     local uses = LP:GetAttribute("WaterUses") or 0
     if uses <= 0 then
         local wellPos = findWell()
@@ -329,12 +341,14 @@ local function tryWater()
             return true
         end
         
+        -- ยิงรีโมทเพื่อเติมน้ำ (ยิงที่ตำแหน่งตัวเอง)
         WaterRemote:FireServer("Water", char:GetPivot().Position)
         Status.Water = "REFILLING"
         task.wait(1.2)
         return true
     end
 
+    -- หาต้นไม้ที่ต้องรด
     local target, dist = findWaterTarget()
     if not target then Status.Water = "ALL DONE" return false end
 
@@ -424,7 +438,7 @@ local function trySell()
     local buyer = findBuyer(targetKind)
     if not buyer then Status.Sell = "NO "..targetKind.." BUYER" return false end
 
-    if buyer.dist > 18 then
+    if buyer.dist > 15 then
         Status.Sell = "WALKING TO "..targetKind
         walkTo(buyer.part.Position)
         return true
@@ -464,9 +478,10 @@ task.spawn(function()
     end
 end)
 
+-- รีเซ็ตรายการที่รดน้ำแล้วทุกๆ 1 นาที (เพื่อไม่ให้ค้างนานเกินไป)
 task.spawn(function()
     while true do
-        task.wait(180)
+        task.wait(60)
         table.clear(wateredSet)
     end
 end)
@@ -499,7 +514,7 @@ local root = mk(gui, "Frame", {
     BackgroundColor3 = Color3.fromRGB(22, 26, 32),
     BorderSizePixel = 0,
     Active = true,
-    ClipsDescendants = true -- สำคัญมาก: ทำให้ตอนย่อแล้วเนื้อหาข้างในถูกซ่อน
+    ClipsDescendants = true
 })
 corner(root, 10)
 mk(root, "UIStroke", { Color = Color3.fromRGB(70, 100, 80), Thickness = 1.5 })
@@ -515,14 +530,13 @@ mk(titleBar, "TextLabel", {
     Size = UDim2.new(1, -60, 1, 0),
     Position = UDim2.fromOffset(12, 0),
     BackgroundTransparency = 1,
-    Text = "🌾 Auto Farm V4",
+    Text = "🌾 Auto Farm V5 (Fix)",
     TextColor3 = Color3.fromRGB(0, 230, 150),
     TextSize = 15,
     Font = Enum.Font.GothamBold,
     TextXAlignment = Enum.TextXAlignment.Left,
 })
 
--- ปุ่มย่อ UI (อยู่มุมขวา)
 local minimizeBtn = mk(titleBar, "TextButton", {
     Size = UDim2.new(0, 24, 0, 24),
     Position = UDim2.new(1, -32, 0, 6),
@@ -548,7 +562,6 @@ minimizeBtn.MouseButton1Click:Connect(function()
     end
 end)
 
--- Content Container (ใส่ทุกอย่างที่ไม่ใช่ TitleBar ไว้ในนี้)
 local content = mk(root, "Frame", {
     Name = "Content",
     Size = UDim2.new(1, 0, 1, -36),
@@ -835,7 +848,6 @@ UserInputService.InputBegan:Connect(function(input, gp)
         local on = not (Config.Harvest or Config.Water or Config.Sell)
         Config.Harvest, Config.Water, Config.Sell = on, on, on
         
-        -- อัพเดท UI
         for _, row in ipairs(content:GetChildren()) do
             if row:IsA("Frame") and row.BackgroundColor3 == Color3.fromRGB(32, 40, 46) then
                 local btn = row:FindFirstChildWhichIsA("TextButton")
@@ -853,4 +865,4 @@ UserInputService.InputBegan:Connect(function(input, gp)
     end
 end)
 
-print("[AutoFarm V4] โหลดเสร็จ — เพิ่มระบบ Minimize UI แล้ว")
+print("[AutoFarm V5] โหลดเสร็จ — แก้ไขระบบรดน้ำและเก็บให้เสถียรขึ้น")
