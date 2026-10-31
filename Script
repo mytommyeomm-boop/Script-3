@@ -1,815 +1,830 @@
 --[[ ============================================================
-    AUTO FARM V7 (Non-Blocking Walk + Accurate Distance)
-============================================================ ]]
+    AUTO DODGE V6 — FINAL
+    ------------------------------------------------------------
+    • Close-range fixed: Margin 0.12 (mid-window) + DASH_WINDOW 0.22
+    • Per-punch cooldown bypass (combo ต่อเนื่อง)
+    • Priority chain: Perfect flag > NeededDirection > Predictive
+    • Fast retry 8ms + RenderStepped (ไม่รอ Heartbeat)
+    • Feint Intercept (ก้างทาง) — armed 0.85s หลัง feint
+    • GUI 2 ปุ่มแยก: toggle + gear (ไม่หาย)
+    ============================================================ ]]
 
-local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local CollectionService = game:GetService("CollectionService")
-local UserInputService  = game:GetService("UserInputService")
-local TweenService      = game:GetService("TweenService")
+local Workspace         = game:GetService("Workspace")
 local RunService        = game:GetService("RunService")
-local Debris            = game:GetService("Debris")
+local Players           = game:GetService("Players")
+local UIS               = game:GetService("UserInputService")
+local TS                = game:GetService("TweenService")
 
 local LP        = Players.LocalPlayer
-local PlayerGui = LP:WaitForChild("PlayerGui")
-local Remotes   = ReplicatedStorage:WaitForChild("Remotes")
+local PGui      = LP:WaitForChild("PlayerGui")
+local ForceDash = ReplicatedStorage:WaitForChild("Events"):WaitForChild("ForceDash")
+local Styles    = require(ReplicatedStorage.Modules:WaitForChild("Styles"))
 
-local HarvestRemote = Remotes:WaitForChild("HarvestFruit", 15)
-local WaterRemote   = Remotes:WaitForChild("Water", 15)
-local SellRemote    = Remotes:WaitForChild("SellDurians", 15)
-local CatchCancel   = Remotes:FindFirstChild("CatchCancel")
-
-local DurianConfig
-pcall(function()
-    DurianConfig = require(ReplicatedStorage.Shared:WaitForChild("DurianConfig"))
-end)
-
--- ============================================================
--- Config + State
--- ============================================================
-local Config = {
-    Harvest     = false,
-    Water       = false,
-    Sell        = false,
-    HarvestRange = 35,
-    WaterRange   = 50,     
-    SellRange    = 250,    
-    AutoPurge    = false,
-    Noclip       = true,
-    Cooldown     = 0.4,
-    ShowRay      = true,
+-- ==========================================================
+--  CONFIG
+-- ==========================================================
+local CFG = {
+    Enabled             = false,
+    Margin              = 0.12,      -- mid-window
+    MinCooldown         = 0.015,     -- rapid punch
+    StrictSide          = true,
+    OnlyWhenTargeted    = true,
+    AntiFeint           = true,
+    FeintIntercept      = true,
+    FeintArmWindow      = 0.85,
+    LatencyCompensation = true,
+    ManualPingOffset    = nil,
+    Debug               = false,
 }
 
-local Status = { Harvest = "IDLE", Water = "IDLE", Sell = "IDLE" }
-local Stats  = { Harvested = 0, Watered = 0, Sold = 0, StartTime = tick() }
-local Busy       = false
-local LastFire   = 0
-local wateredSet = setmetatable({}, { __mode = "k" })
+local DASH_WINDOW = 0.22             -- perfect window (server ~0.22s)
 
--- ============================================================
--- Helpers
--- ============================================================
-local function getChar()
+-- ==========================================================
+--  STATE
+-- ==========================================================
+local lastDodgeTime   = 0
+local lastDodgePunchId = nil
+local opponent        = nil
+local oppConns        = {}
+local myConns         = {}
+local alternateSide   = "Left"
+local punchStates     = {}
+local pendingDodge    = nil
+local feint = {
+    count = 0, lastAt = 0, armedUntil = 0, armedDirection = nil,
+}
+local stats = { dodges = 0, perfects = 0, intercepts = 0, predictives = 0 }
+
+local function log(...)
+    if CFG.Debug then print("[Dodge]", ...) end
+end
+
+-- ==========================================================
+--  HELPERS
+-- ==========================================================
+local function getState(n)
+    local s = Workspace:FindFirstChild("States")
+    return s and s:FindFirstChild(n)
+end
+local function getMyCD()  local s = getState(LP.Name); return s and s:FindFirstChild("CharacterData") end
+local function getMyOcc() local s = getState(LP.Name); return s and s:FindFirstChild("Occupied") end
+
+local function canDash()
     local c = LP.Character
-    return c, c and c:FindFirstChild("HumanoidRootPart"), c and c:FindFirstChildOfClass("Humanoid")
+    if not (c and c.PrimaryPart) then return false end
+    local o = getMyOcc(); if not o then return false end
+    if o.Dashing.Value then return false end
+    local d = getMyCD(); if not d then return false end
+    if d.Stunned.Value or d.Cutscene.Value then return false end
+    if d.Stamina.Value <= 1 then return false end
+    if c:GetAttribute("RiceballChanneling") then return false end
+    if c:GetAttribute("NoDash") then return false end
+    return true
 end
 
-local function freeHands()
-    local char = getChar()
+local function getNeededDirection()
+    local c = LP.Character; if not c then return nil end
+    local dir = c:GetAttribute("NeededDirection")
+    if dir == "Left" or dir == "Right" or dir == "Forward" or dir == "Backward" then
+        return dir
+    end
+    return nil
+end
+
+local function computeSideDirection()
+    local c = LP.Character
+    if not (c and c.PrimaryPart) then return alternateSide end
+    local o = getMyOcc()
+    local locked = o and o.LockedOn.Value
+    if locked and locked.PrimaryPart then
+        local away = (c.PrimaryPart.Position - locked.PrimaryPart.Position) * Vector3.new(1,0,1)
+        if away.Magnitude > 0.1 then
+            away = away.Unit
+            local side = Vector3.new(away.Z, 0, -away.X)
+            local look = c.PrimaryPart.CFrame.LookVector * Vector3.new(1,0,1)
+            if look.Magnitude > 0.1 then
+                return side:Dot(look.Unit) > 0 and "Right" or "Left"
+            end
+        end
+    end
+    return alternateSide
+end
+
+local function isOppFeinting(opp)
+    if not opp then return false end
+    return opp:GetAttribute("IsFeinting") == true
+        or opp:GetAttribute("LocalIsFeinting") == true
+end
+
+local function getOppHitDirection(opp)
+    if not opp then return nil end
+    local os = getState(opp.Name); if not os then return nil end
+    local pd = os:FindFirstChild("PlayerData")
+    local occ = os:FindFirstChild("Occupied")
+    if not (pd and occ) then return nil end
+    local sv = pd:FindFirstChild("Style"); if not sv then return nil end
+    local style = Styles[sv.Value]; if not style then return nil end
+
+    local isHeavy = opp:GetAttribute("IsHeavy") == true
+    local comboId = 1
+    local cc = occ:FindFirstChild("CurrentCombo"); if cc then comboId = cc.Value end
+    local punchNum = 1
+    local cp = occ:FindFirstChild("CurrentPunch"); if cp then punchNum = cp.Value end
+
+    if isHeavy then
+        local ha = style.HeavyAttacks
+        if ha and ha[punchNum] and ha[punchNum].HitInfo then
+            return ha[punchNum].HitInfo.Direction
+        end
+    else
+        local combo = style.Combos[comboId]
+        if combo then
+            local hit = combo[punchNum]
+            if hit and hit.HitInfo and hit.HitInfo.Direction then
+                return hit.HitInfo.Direction
+            end
+            if combo.DefaultPunchInfo and combo.DefaultPunchInfo.HitInfo then
+                return combo.DefaultPunchInfo.HitInfo.Direction
+            end
+        end
+    end
+    return nil
+end
+
+local function hitDirToDodge(hitDir)
+    if not hitDir then return nil end
+    if hitDir == "Left" or hitDir == "BodyLeft" then return "Right"
+    elseif hitDir == "Right" or hitDir == "BodyRight" then return "Left"
+    elseif hitDir == "Forward" or hitDir == "BodyForward" then return alternateSide
+    end
+    return nil
+end
+
+local function getPingOffset()
+    if CFG.ManualPingOffset then return CFG.ManualPingOffset end
+    if not CFG.LatencyCompensation then return 0 end
+    return math.clamp((LP:GetNetworkPing() or 0) / 2, 0.02, 0.10)
+end
+
+-- ==========================================================
+--  DASH — per-punch bypass
+-- ==========================================================
+local function executeDash(dir, isIntercept, isPredictive)
+    lastDodgeTime = Workspace:GetServerTimeNow()
+    ForceDash:Fire({ Direction = dir, IgnoreStun = false })
+    if dir == "Left"  then alternateSide = "Right"
+    elseif dir == "Right" then alternateSide = "Left" end
+    stats.dodges = stats.dodges + 1
+    if isIntercept  then stats.intercepts  = stats.intercepts + 1  end
+    if isPredictive then stats.predictives = stats.predictives + 1 end
+    log("DASH →", dir,
+        isIntercept and "(INTERCEPT)" or isPredictive and "(PRED)" or "")
+
+    task.spawn(function()
+        local deadline = lastDodgeTime + 0.2
+        while Workspace:GetServerTimeNow() < deadline do
+            local c = LP.Character
+            if c and c:GetAttribute("Perfect") then
+                stats.perfects = stats.perfects + 1
+                return
+            end
+            task.wait(0.01)
+        end
+    end)
+    return true
+end
+
+local function tryDash(dir, isIntercept, punchId, isPredictive)
+    if not dir then return false end
+    local now = Workspace:GetServerTimeNow()
+
+    if not canDash() then
+        pendingDodge = {
+            dir = dir, expires = now + 0.4,
+            intercept = isIntercept, punchId = punchId, predictive = isPredictive,
+        }
+        return false
+    end
+
+    -- per-punch cooldown bypass
+    local isNewPunch = punchId and punchId ~= lastDodgePunchId
+    if not isNewPunch and now - lastDodgeTime < CFG.MinCooldown then
+        pendingDodge = {
+            dir = dir, expires = now + 0.4,
+            intercept = isIntercept, punchId = punchId, predictive = isPredictive,
+        }
+        return false
+    end
+
+    lastDodgePunchId = punchId
+    return executeDash(dir, isIntercept, isPredictive)
+end
+
+-- ==========================================================
+--  FEINT INTERCEPT (ก้างทาง)
+-- ==========================================================
+local function armFeintIntercept(opp)
+    local guess = hitDirToDodge(getOppHitDirection(opp))
+    feint.count = feint.count + 1
+    feint.lastAt = Workspace:GetServerTimeNow()
+    feint.armedUntil = feint.lastAt + CFG.FeintArmWindow
+    feint.armedDirection = guess
+    pendingDodge = nil
+    if opponent then
+        local cpId = opponent:GetAttribute("CurrentPunchId") or 0
+        if punchStates[cpId] then punchStates[cpId].cancelled = true end
+    end
+    log("FEINT armed →", guess or "?", "win", CFG.FeintArmWindow)
+end
+
+local function isInterceptArmed()
+    return CFG.FeintIntercept and Workspace:GetServerTimeNow() < feint.armedUntil
+end
+
+local function tryIntercept()
+    if not isInterceptArmed() then return end
+    if not opponent then return end
+
+    local cpId = opponent:GetAttribute("CurrentPunchId") or 0
+    local state = punchStates[cpId]
+    if state and state.dodged then return end
+
+    local nd = getNeededDirection()
+    if nd then
+        if tryDash(nd, true, cpId) then
+            punchStates[cpId] = punchStates[cpId] or { startTime = Workspace:GetServerTimeNow() }
+            punchStates[cpId].dodged = true
+            feint.armedUntil = 0
+        end
+        return
+    end
+
+    local landTime = opponent:GetAttribute("LandTime")
+    if landTime then
+        local now    = Workspace:GetServerTimeNow()
+        local offset = getPingOffset()
+        local left   = landTime - now
+        if left <= (offset + CFG.Margin) and left >= -0.08 then
+            local dir = feint.armedDirection or computeSideDirection()
+            if tryDash(dir, true, cpId) then
+                punchStates[cpId] = punchStates[cpId] or {}
+                punchStates[cpId].dodged = true
+                feint.armedUntil = 0
+            end
+        end
+    end
+end
+
+-- ==========================================================
+--  PUNCH TRACKING
+-- ==========================================================
+local function onPunch(opp, forceHeavy)
+    if not CFG.Enabled then return end
+    if CFG.OnlyWhenTargeted then
+        local os  = getState(opp.Name)
+        local occ = os and os:FindFirstChild("Occupied")
+        local tgt = occ and occ:FindFirstChild("LockedOn")
+        if tgt and tgt.Value ~= LP.Character then return end
+    end
+    local id = opp:GetAttribute("CurrentPunchId") or 0
+    punchStates[id] = {
+        dodged    = false,
+        cancelled = false,
+        startTime = Workspace:GetServerTimeNow(),
+        isHeavy   = forceHeavy or (opp:GetAttribute("IsHeavy") == true),
+    }
+    log("punch id=", id, "heavy=", tostring(punchStates[id].isHeavy))
+
+    local now = Workspace:GetServerTimeNow()
+    for k, v in pairs(punchStates) do
+        if k ~= id and (now - v.startTime) > 3 then punchStates[k] = nil end
+    end
+
+    if isInterceptArmed() then tryIntercept() end
+end
+
+-- ==========================================================
+--  MAIN DODGE LOGIC — Priority Chain
+-- ==========================================================
+local function tryDodgeForCurrentPunch()
+    if not CFG.Enabled then return end
+    if not opponent then return end
+    if CFG.AntiFeint and isOppFeinting(opponent) then return end
+
+    if isInterceptArmed() then
+        tryIntercept()
+        return
+    end
+
+    local cpId = opponent:GetAttribute("CurrentPunchId") or 0
+    local state = punchStates[cpId]
+    if state and (state.dodged or state.cancelled) then return end
+
+    local char = LP.Character
     if not char then return end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if hum and char:FindFirstChildOfClass("Tool") then
-        pcall(function() hum:UnequipTools() end)
-        task.wait(0.15)
-    end
-end
 
-local function holdPrompt(prompt)
-    if not prompt or not prompt.Enabled then return false end
-    pcall(function()
-        prompt:InputHoldBegin()
-        task.wait(prompt.HoldDuration + 0.1)
-        prompt:InputHoldEnd()
-    end)
-    task.wait(0.2)
-    return true
-end
-
-local function showRay(from, to, color)
-    if not Config.ShowRay then return end
-    local dir = to - from
-    local len = dir.Magnitude
-    if len < 0.2 then return end
-    local mid = from + dir * 0.5
-    
-    local p = Instance.new("Part")
-    p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
-    p.CastShadow, p.Material = false, Enum.Material.Neon
-    p.Color = color or Color3.fromRGB(0, 255, 140)
-    p.Size = Vector3.new(0.1, 0.1, len)
-    p.CFrame = CFrame.lookAt(mid, mid + dir.Unit)
-    p.Transparency = 0.5
-    p.Parent = workspace
-    
-    TweenService:Create(p, TweenInfo.new(0.5), {Transparency = 1}):Play()
-    Debris:AddItem(p, 0.6)
-end
-
--- ============================================================
--- NOCLIP
--- ============================================================
-RunService.Stepped:Connect(function()
-    if Config.Noclip and LP.Character then
-        for _, part in ipairs(LP.Character:GetDescendants()) do
-            if part:IsA("BasePart") and part.CanCollide then
-                part.CanCollide = false
-            end
+    -- ═══ P1: Perfect flag SET ═══
+    if char:GetAttribute("Perfect") then
+        local nd = getNeededDirection()
+        if nd and tryDash(nd, false, cpId) then
+            punchStates[cpId] = punchStates[cpId] or { startTime = Workspace:GetServerTimeNow() }
+            punchStates[cpId].dodged = true
+            log("★ PERFECT (flag) →", nd)
         end
+        return
     end
-end)
 
--- ============================================================
--- HARVEST
--- ============================================================
-local function findPrompt(fruit)
-    for _, d in ipairs(fruit:GetDescendants()) do
-        if d.Name == "Harvest" and d:IsA("ProximityPrompt") then return d end
-    end
-end
-
-local function canHarvest(fruit)
-    if not fruit or not fruit.Parent then return false end
-    if fruit:GetAttribute("CatchBy") then return false end
-    local part = fruit:FindFirstChildWhichIsA("BasePart", true)
-    if not part then return false end
-    local prompt = findPrompt(fruit)
-    if not prompt or not prompt.Enabled then return false end
-
-    local unripe = prompt:GetAttribute("Unripe")
-    if unripe and not Config.AutoPurge then return false end
-    return true, prompt, part
-end
-
-local function findHarvestProximity()
-    local _, root = getChar()
-    if not root then return end
-    local best, bestD = nil, Config.HarvestRange
-    for _, fruit in ipairs(CollectionService:GetTagged("DurianFruit")) do
-        local ok, prompt, part = canHarvest(fruit)
-        if ok then
-            local pos = prompt.Parent:IsA("BasePart") and prompt.Parent.Position or part.Position
-            -- ใช้ระยะ 2D ในการหาเป้าหมาย (ไม่สนความสูง)
-            local d = (Vector3.new(pos.X, root.Position.Y, pos.Z) - root.Position).Magnitude
-            if d < bestD then
-                best = { fruit=fruit, prompt=prompt, part=part, pos=pos, dist=d }
-                bestD = d
-            end
+    -- ═══ P2: NeededDirection set ═══
+    local nd = getNeededDirection()
+    if nd then
+        if tryDash(nd, false, cpId) then
+            punchStates[cpId] = punchStates[cpId] or { startTime = Workspace:GetServerTimeNow() }
+            punchStates[cpId].dodged = true
+            log("★ ND instant →", nd)
         end
-    end
-    return best
-end
-
-local function tryHarvest()
-    local char, root, hum = getChar()
-    if not char or not root or not hum then Status.Harvest = "NO CHAR" return false end
-    if char:GetAttribute("CatchStart") then Status.Harvest = "CATCHING..." return true end
-
-    Status.Harvest = "SEARCHING"
-    local target = findHarvestProximity()
-    if not target then 
-        hum:MoveTo(root.Position) -- สั่งหยุดเดิน
-        Status.Harvest = "NO TARGET" 
-        return false 
+        return
     end
 
-    -- ถ้าระยะ 2D ไกลกว่า 10 ฟุต ให้เดินเข้าไปหา (ใช้ MoveTo แบบไม่บล็อค)
-    if target.dist > 10 then
-        Status.Harvest = "WALKING TO FRUIT"
-        local movePos = Vector3.new(target.pos.X, root.Position.Y, target.pos.Z)
-        hum:MoveTo(movePos)
-        return true -- รอ Tick ถัดไป
-    end
-
-    hum:MoveTo(root.Position) -- สั่งหยุดเดินเมื่อใกล้พอ
-    freeHands() 
-    showRay(root.Position + Vector3.new(0, 2, 0), target.pos, Color3.fromRGB(0, 255, 140))
-    Status.Harvest = "HARVESTING"
-
-    local ok = pcall(function() HarvestRemote:FireServer(target.prompt) end)
-    if not ok then return false end
-
-    local t0 = tick()
-    local started = false
-    while tick() - t0 < 3 do
-        if char:GetAttribute("CatchStart") then started = true break end
-        if not char.Parent then return false end
-        task.wait(0.05)
-    end
-    if not started then 
-        Status.Harvest = "FAILED (Too far?)"
-        return false 
-    end
-
-    t0 = tick()
-    while char.Parent and char:GetAttribute("CatchStart") and (tick() - t0) < 10 do
-        task.wait(0.1)
-    end
-    
-    if char:GetAttribute("CatchStart") then
-        if CatchCancel then pcall(function() CatchCancel:FireServer() end) end
-        Stats.Harvested = Stats.Harvested + 1
-        Status.Harvest = "DONE ✓"
-    else
-        Status.Harvest = "FAILED"
-    end
-    return true
-end
-
--- ============================================================
--- WATER
--- ============================================================
-local function findWateringCan()
-    local char = LP.Character
-    local bp = LP:FindFirstChildOfClass("Backpack")
-    for _, c in ipairs({ char, bp }) do
-        if c then
-            for _, t in ipairs(c:GetChildren()) do
-                if t:IsA("Tool") and t:GetAttribute("GearId") == "WateringCan" then return t end
+    -- ═══ P3: Predictive (LandTime mid-window + HitInfo) ═══
+    local landTime = opponent:GetAttribute("LandTime")
+    if landTime then
+        local now    = Workspace:GetServerTimeNow()
+        local offset = getPingOffset()
+        local windowStart = landTime - DASH_WINDOW - offset
+        if now >= windowStart and now <= (landTime - 0.02) then
+            local d = hitDirToDodge(getOppHitDirection(opponent)) or computeSideDirection()
+            if CFG.StrictSide and (d == "Forward" or d == "Backward") then
+                d = computeSideDirection()
+            end
+            if tryDash(d, false, cpId, true) then
+                punchStates[cpId] = punchStates[cpId] or { startTime = now }
+                punchStates[cpId].dodged = true
+                log("★ Predictive →", d)
             end
         end
     end
 end
 
-local function getMyBase()
-    local map = workspace:FindFirstChild("Map")
-    local bases = map and map:FindFirstChild("Bases")
-    if not bases then return nil end
-    for _, b in ipairs(bases:GetChildren()) do
-        if b:GetAttribute("OwnerUserId") == LP.UserId then return b end
-    end
-end
-
-local function findWellPrompt()
-    local base = getMyBase()
-    if not base then return end
-    for _, d in ipairs(base:GetDescendants()) do
-        if d:IsA("ProximityPrompt") and (d.ActionText:lower():find("fill") or d.ObjectText:lower():find("well")) then
-            if d.Enabled and d.Parent and d.Parent:IsA("BasePart") then
-                return d, d.Parent.Position
-            end
-        end
-    end
-end
-
-local function findWaterTarget()
-    local _, root = getChar()
-    if not root then return end
-    local base = getMyBase()
-    if not base then return end
-
-    local best, bestD = nil, Config.WaterRange
-    for _, slot in ipairs(base:GetDescendants()) do
-        if slot:IsA("Model") then
-            local plantSpot = slot:FindFirstChild("PlantSpot")
-            if plantSpot and plantSpot:IsA("BasePart") and not wateredSet[plantSpot] then
-                if slot:FindFirstChild("Tree") or slot:FindFirstChild("Seed") then
-                    local dist = (plantSpot.Position - root.Position).Magnitude
-                    if dist < bestD then
-                        best = plantSpot
-                        bestD = dist
-                    end
-                end
-            end
-        end
-    end
-    return best, bestD
-end
-
-local function tryWater()
-    local char, root, hum = getChar()
-    if not char or not root or not hum then Status.Water = "NO CHAR" return false end
-
-    local can = findWateringCan()
-    if not can then Status.Water = "NO CAN" return false end
-
-    local curTool = char:FindFirstChildOfClass("Tool")
-    if curTool ~= can then
-        pcall(function() hum:EquipTool(can) end) 
-        task.wait(0.1)
-    end
-
-    local uses = LP:GetAttribute("WaterUses") or 0
-    
-    -- ถ้ามีน้ำ ให้ไปรดต้นไม้
-    if uses > 0 then
-        local target, dist = findWaterTarget()
-        if not target then 
-            hum:MoveTo(root.Position)
-            Status.Water = "ALL DONE" 
-            return false 
-        end
-
-        if dist > 10 then
-            Status.Water = "WALKING TO PLANT"
-            hum:MoveTo(Vector3.new(target.Position.X, root.Position.Y, target.Position.Z))
-            return true
-        end
-
-        hum:MoveTo(root.Position) -- หยุดเดิน
-        local usesBefore = LP:GetAttribute("WaterUses") or 0
-        WaterRemote:FireServer("Water", target.Position)
-        showRay(root.Position + Vector3.new(0, 2, 0), target.Position, Color3.fromRGB(90, 190, 255))
-        task.wait(0.8)
-        local usesAfter = LP:GetAttribute("WaterUses") or 0
-
-        wateredSet[target] = true
-        if usesAfter < usesBefore then
-            Stats.Watered = Stats.Watered + 1
-            Status.Water = "WATERED ✓"
-        else
-            Status.Water = "ALREADY WET"
-        end
-        return true
-    else
-        -- ถ้าน้ำหมด ให้ไปเติมน้ำที่บ่อ
-        local wellPrompt, wellPos = findWellPrompt()
-        if not wellPrompt or not wellPos then 
-            hum:MoveTo(root.Position)
-            Status.Water = "NO WELL FOUND" 
-            return false 
-        end
-        
-        local dist = (Vector3.new(wellPos.X, root.Position.Y, wellPos.Z) - root.Position).Magnitude
-        if dist > 10 then
-            Status.Water = "WALKING TO WELL"
-            hum:MoveTo(Vector3.new(wellPos.X, root.Position.Y, wellPos.Z))
-            return true
-        end
-        
-        hum:MoveTo(root.Position) -- หยุดเดิน
-        Status.Water = "REFILLING"
-        holdPrompt(wellPrompt)
-        task.wait(1.5)
-        return true
-    end
-end
-
--- ============================================================
--- SELL
--- ============================================================
-local function inventoryCount()
-    local counts = { durian=0, lump=0, palm=0 }
-    local char = LP.Character
-    local bp = LP:FindFirstChildOfClass("Backpack")
-    for _, c in ipairs({ char, bp }) do
-        if c then
-            for _, t in ipairs(c:GetChildren()) do
-                if t:IsA("Tool") then
-                    if t:GetAttribute("FruitUid") then
-                        local fid = t:GetAttribute("FruitId")
-                        local isPalm = false
-                        if DurianConfig and DurianConfig.ById[fid] then
-                            isPalm = DurianConfig.ById[fid].Buyer == "Palm"
-                        end
-                        if isPalm then counts.palm = counts.palm + 1
-                        else counts.durian = counts.durian + 1 end
-                    elseif t:GetAttribute("ScrapUid") then
-                        counts.lump = counts.lump + 1
-                    end
-                end
-            end
-        end
-    end
-    return counts
-end
-
-local function findBuyer(kind)
-    local _, root = getChar()
-    if not root then return end
-    local best, bestD = nil, Config.SellRange
-    for _, d in ipairs(workspace:GetDescendants()) do
-        if d:IsA("Model") and d:GetAttribute("BuyerKind") == kind then
-            local part = d:FindFirstChild("HumanoidRootPart") or d:FindFirstChild("Head") or d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart")
-            if part then
-                local dist = (part.Position - root.Position).Magnitude
-                if dist < bestD then
-                    best = { model=d, part=part, kind=kind, dist=dist }
-                    bestD = dist
-                end
-            end
-        end
-    end
-    return best
-end
-
-local function trySell()
-    local char, root, hum = getChar()
-    if not char or not root or not hum then Status.Sell = "NO CHAR" return false end
-
-    local inv = inventoryCount()
-    if (inv.durian + inv.lump + inv.palm) == 0 then 
-        hum:MoveTo(root.Position)
-        Status.Sell = "NOTHING" 
-        return false 
-    end
-    if not SellRemote then Status.Sell = "NO REMOTE" return false end
-
-    local targetKind = nil
-    if inv.durian > 0 then targetKind = "Durian"
-    elseif inv.lump > 0 then targetKind = "Rubber"
-    elseif inv.palm > 0 then targetKind = "Palm" end
-    
-    local buyer = findBuyer(targetKind)
-    if not buyer then 
-        hum:MoveTo(root.Position)
-        Status.Sell = "NO "..targetKind.." BUYER" 
-        return false 
-    end
-
-    if buyer.dist > 15 then
-        Status.Sell = "WALKING TO "..targetKind
-        hum:MoveTo(Vector3.new(buyer.part.Position.X, root.Position.Y, buyer.part.Position.Z))
-        return true
-    end
-
-    hum:MoveTo(root.Position) -- หยุดเดิน
-    local mode
-    if targetKind == "Durian" then mode = "All"
-    elseif targetKind == "Rubber" then mode = "LumpAll"
-    elseif targetKind == "Palm" then mode = "PalmAll" end
-
-    local ok = pcall(function() SellRemote:FireServer(mode) end)
-    if ok then
-        Stats.Sold = Stats.Sold + 1
-        Status.Sell = "SOLD (" .. targetKind .. ")"
-        task.wait(1.5)
-    else
-        Status.Sell = "FAILED"
-    end
-    return true
-end
-
--- ============================================================
--- MAIN LOOP
--- ============================================================
+-- ==========================================================
+--  FAST RETRY (8ms) — pending queue
+-- ==========================================================
 task.spawn(function()
     while true do
-        if not Busy then
-            local anyOn = Config.Sell or Config.Harvest or Config.Water
-            if anyOn and (tick() - LastFire) >= Config.Cooldown then
-                local did = false
-                if Config.Sell then Busy = true did = trySell() if did then LastFire = tick() end Busy = false end
-                if not did and Config.Harvest then Busy = true did = tryHarvest() if did then LastFire = tick() end Busy = false end
-                if not did and Config.Water then Busy = true did = tryWater() if did then LastFire = tick() end Busy = false end
+        task.wait(0.008)
+        if not CFG.Enabled then continue end
+        if pendingDodge then
+            local now = Workspace:GetServerTimeNow()
+            if now > pendingDodge.expires then
+                pendingDodge = nil
+            elseif canDash() then
+                local p = pendingDodge
+                pendingDodge = nil
+                executeDash(p.dir, p.intercept, p.predictive)
             end
         end
-        task.wait(0.08)
     end
 end)
+
+-- ==========================================================
+--  LOOPS — RenderStepped + Heartbeat สำรอง
+-- ==========================================================
+RunService.RenderStepped:Connect(function()
+    if not CFG.Enabled then return end
+    tryDodgeForCurrentPunch()
+end)
+
+RunService.Heartbeat:Connect(function()
+    if not CFG.Enabled then return end
+    tryDodgeForCurrentPunch()
+end)
+
+-- ==========================================================
+--  MY CHARACTER — NeededDirection instant
+-- ==========================================================
+local function bindMyChar(char)
+    for _, c in ipairs(myConns) do c:Disconnect() end
+    table.clear(myConns)
+    if not char then return end
+
+    table.insert(myConns, char:GetAttributeChangedSignal("NeededDirection"):Connect(function()
+        if not CFG.Enabled then return end
+        local nd = getNeededDirection()
+        if not nd then return end
+        if not opponent then return end
+        if CFG.AntiFeint and isOppFeinting(opponent) then return end
+
+        local cpId = opponent:GetAttribute("CurrentPunchId") or 0
+        local state = punchStates[cpId]
+        if state and state.dodged then return end
+
+        local isInt = isInterceptArmed()
+        if tryDash(nd, isInt, cpId) then
+            punchStates[cpId] = punchStates[cpId] or {}
+            punchStates[cpId].dodged = true
+            if isInt then feint.armedUntil = 0 end
+            log("instant ND →", nd, isInt and "(INT)" or "")
+        end
+    end))
+end
+
+-- ==========================================================
+--  OPPONENT BINDING
+-- ==========================================================
+local function unbindOpp()
+    for _, c in ipairs(oppConns) do c:Disconnect() end
+    table.clear(oppConns)
+    opponent = nil
+end
+
+local function bindOpp(oppChar)
+    unbindOpp()
+    if not oppChar then return end
+    opponent = oppChar
+    log("bound:", oppChar.Name)
+
+    local lastId = oppChar:GetAttribute("CurrentPunchId") or 0
+    table.insert(oppConns, oppChar:GetAttributeChangedSignal("CurrentPunchId"):Connect(function()
+        local nid = oppChar:GetAttribute("CurrentPunchId") or 0
+        if nid ~= lastId then
+            lastId = nid
+            onPunch(oppChar, nil)
+        end
+    end))
+
+    local wp = oppChar:GetAttribute("Punching") or false
+    table.insert(oppConns, oppChar:GetAttributeChangedSignal("Punching"):Connect(function()
+        local n = oppChar:GetAttribute("Punching") or false
+        if n and not wp then onPunch(oppChar, nil) end
+        wp = n
+    end))
+
+    local wh = oppChar:GetAttribute("HeavyPunching") or false
+    table.insert(oppConns, oppChar:GetAttributeChangedSignal("HeavyPunching"):Connect(function()
+        local n = oppChar:GetAttribute("HeavyPunching") or false
+        if n and not wh then onPunch(oppChar, true) end
+        wh = n
+    end))
+
+    local wf = oppChar:GetAttribute("IsFeinting") or false
+    table.insert(oppConns, oppChar:GetAttributeChangedSignal("IsFeinting"):Connect(function()
+        local n = oppChar:GetAttribute("IsFeinting") or false
+        if n and not wf then
+            if CFG.AntiFeint or CFG.FeintIntercept then
+                armFeintIntercept(oppChar)
+            end
+        end
+        wf = n
+    end))
+end
+
+local function watchOpp()
+    local cd = getMyCD(); if not cd then return end
+    local oppVal = cd:FindFirstChild("Opponent"); if not oppVal then return end
+    bindOpp(oppVal.Value)
+    table.insert(oppConns, oppVal.Changed:Connect(bindOpp))
+end
 
 task.spawn(function()
-    while true do
-        task.wait(60)
-        table.clear(wateredSet)
-    end
+    while not getMyCD() do task.wait(0.2) end
+    watchOpp()
+    if LP.Character then bindMyChar(LP.Character) end
+end)
+LP.CharacterAdded:Connect(function(c)
+    task.wait(1)
+    watchOpp()
+    bindMyChar(c)
 end)
 
--- ============================================================
--- UI
--- ============================================================
-local function mk(parent, class, props)
-    local o = Instance.new(class)
-    for k, v in pairs(props or {}) do o[k] = v end
-    o.Parent = parent
-    return o
+-- ==========================================================
+--  GUI — 2 ปุ่มแยก (toggle + gear) ไม่หาย
+-- ==========================================================
+local COLORS = {
+    Bg        = Color3.fromRGB(28, 30, 38),
+    On        = Color3.fromRGB(50, 200, 100),
+    Off       = Color3.fromRGB(210, 65, 70),
+    Text      = Color3.fromRGB(240, 240, 245),
+    TextDim   = Color3.fromRGB(150, 155, 170),
+    Slider    = Color3.fromRGB(85, 130, 255),
+    SliderBg  = Color3.fromRGB(50, 55, 70),
+    Panel     = Color3.fromRGB(22, 24, 30),
+    Gear      = Color3.fromRGB(60, 90, 180),
+    GearHi    = Color3.fromRGB(90, 130, 240),
+    Intercept = Color3.fromRGB(200, 130, 50),
+    Perfect   = Color3.fromRGB(255, 215, 80),
+    Predictive= Color3.fromRGB(150, 180, 255),
+}
+
+local old = PGui:FindFirstChild("AutoDodgeUI")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "AutoDodgeUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 9999
+gui.Parent = PGui
+
+-- ============ TOGGLE BUTTON ============
+local TSIZE = 56
+local toggle = Instance.new("TextButton")
+toggle.Name = "MainToggle"
+toggle.Size = UDim2.fromOffset(TSIZE, TSIZE)
+toggle.Position = UDim2.new(1, -TSIZE - 20, 0.5, -TSIZE / 2)
+toggle.BackgroundColor3 = CFG.Enabled and COLORS.On or COLORS.Off
+toggle.Text = CFG.Enabled and "✓" or "✕"
+toggle.TextColor3 = COLORS.Text
+toggle.TextSize = 28
+toggle.Font = Enum.Font.GothamBlack
+toggle.AutoButtonColor = false
+toggle.BorderSizePixel = 0
+toggle.ZIndex = 10
+toggle.Parent = gui
+Instance.new("UICorner", toggle).CornerRadius = UDim.new(1, 0)
+local stroke = Instance.new("UIStroke", toggle)
+stroke.Color = Color3.new(0,0,0); stroke.Thickness = 2; stroke.Transparency = 0.4
+
+local lbl = Instance.new("TextLabel")
+lbl.Size = UDim2.new(1, 60, 0, 14)
+lbl.Position = UDim2.new(0.5, -30, 1, 4)
+lbl.BackgroundTransparency = 1
+lbl.Text = "AUTO DODGE"
+lbl.TextColor3 = COLORS.TextDim
+lbl.TextSize = 10
+lbl.Font = Enum.Font.GothamBold
+lbl.ZIndex = 10
+lbl.Parent = toggle
+
+-- ============ GEAR BUTTON ============
+local GSIZE = 34
+local gear = Instance.new("TextButton")
+gear.Name = "GearBtn"
+gear.Size = UDim2.fromOffset(GSIZE, GSIZE)
+gear.Position = UDim2.fromOffset(
+    toggle.Position.X.Offset + (TSIZE - GSIZE) / 2,
+    toggle.Position.Y.Offset + TSIZE + 6
+)
+gear.BackgroundColor3 = COLORS.Gear
+gear.Text = "⚙"
+gear.TextColor3 = COLORS.Text
+gear.TextSize = 18
+gear.Font = Enum.Font.GothamBold
+gear.AutoButtonColor = false
+gear.BorderSizePixel = 0
+gear.ZIndex = 10
+gear.Parent = gui
+Instance.new("UICorner", gear).CornerRadius = UDim.new(1, 0)
+local gs = Instance.new("UIStroke", gear)
+gs.Color = Color3.new(0,0,0); gs.Thickness = 1.5; gs.Transparency = 0.4
+
+-- ============ SETTINGS PANEL ============
+local panel = Instance.new("Frame")
+panel.Name = "SettingsPanel"
+panel.Size = UDim2.fromOffset(240, 460)
+panel.Position = UDim2.fromOffset(
+    toggle.Position.X.Offset - 250,
+    toggle.Position.Y.Offset - 230
+)
+panel.BackgroundColor3 = COLORS.Panel
+panel.BorderSizePixel = 0
+panel.Visible = false
+panel.ZIndex = 9
+panel.Parent = gui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
+local ps = Instance.new("UIStroke", panel)
+ps.Color = Color3.fromRGB(60, 65, 85); ps.Thickness = 1
+
+local function mkLabel(parent, text, y, color, size)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, -20, 0, 18)
+    l.Position = UDim2.fromOffset(10, y)
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.TextColor3 = color or COLORS.Text
+    l.TextSize = size or 13
+    l.Font = Enum.Font.GothamSemibold
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.ZIndex = 10
+    l.Parent = parent
+    return l
 end
-local function corner(p, r) return mk(p, "UICorner", { CornerRadius = UDim.new(0, r or 6) }) end
 
-local gui = mk(PlayerGui, "ScreenGui", {
-    Name = "AutoFarmGui",
-    ResetOnSpawn = false,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-    DisplayOrder = 999,
-})
-
-local FULL_SIZE = UDim2.fromOffset(320, 520)
-local MINI_SIZE = UDim2.fromOffset(320, 36)
-
-local root = mk(gui, "Frame", {
-    Name = "Main",
-    Size = FULL_SIZE,
-    Position = UDim2.new(0, 20, 0, 80),
-    BackgroundColor3 = Color3.fromRGB(22, 26, 32),
-    BorderSizePixel = 0,
-    Active = true,
-    ClipsDescendants = true
-})
-corner(root, 10)
-mk(root, "UIStroke", { Color = Color3.fromRGB(70, 100, 80), Thickness = 1.5 })
-
-local titleBar = mk(root, "Frame", {
-    Name = "TitleBar",
-    Size = UDim2.new(1, 0, 0, 36),
-    BackgroundColor3 = Color3.fromRGB(30, 38, 40),
-    BorderSizePixel = 0,
-})
-corner(titleBar, 10)
-mk(titleBar, "TextLabel", {
-    Size = UDim2.new(1, -60, 1, 0),
-    Position = UDim2.fromOffset(12, 0),
-    BackgroundTransparency = 1,
-    Text = "🌾 Auto Farm V7",
-    TextColor3 = Color3.fromRGB(0, 230, 150),
-    TextSize = 15,
-    Font = Enum.Font.GothamBold,
-    TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-local minimizeBtn = mk(titleBar, "TextButton", {
-    Size = UDim2.new(0, 24, 0, 24),
-    Position = UDim2.new(1, -32, 0, 6),
-    BackgroundColor3 = Color3.fromRGB(60, 70, 75),
-    Text = "-",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 18,
-    Font = Enum.Font.GothamBold,
-    AutoButtonColor = false,
-    BorderSizePixel = 0,
-})
-corner(minimizeBtn, 4)
-
-local isMinimized = false
-minimizeBtn.MouseButton1Click:Connect(function()
-    isMinimized = not isMinimized
-    if isMinimized then
-        minimizeBtn.Text = "+"
-        TweenService:Create(root, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = MINI_SIZE}):Play()
-    else
-        minimizeBtn.Text = "-"
-        TweenService:Create(root, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = FULL_SIZE}):Play()
-    end
-end)
-
-local content = mk(root, "Frame", {
-    Name = "Content",
-    Size = UDim2.new(1, 0, 1, -36),
-    Position = UDim2.fromOffset(0, 36),
-    BackgroundTransparency = 1,
-})
-
-local ROW_H  = 60
-local Y_START = 8
-
-local function makeToggleRow(key, label, color, yPos)
-    local row = mk(content, "Frame", {
-        Size = UDim2.new(1, -24, 0, ROW_H),
-        Position = UDim2.fromOffset(12, yPos),
-        BackgroundColor3 = Color3.fromRGB(32, 40, 46),
-        BorderSizePixel = 0,
-    })
-    corner(row, 8)
-
-    local btn = mk(row, "TextButton", {
-        Size = UDim2.new(0, 90, 0, 30),
-        Position = UDim2.fromOffset(10, 8),
-        BackgroundColor3 = Color3.fromRGB(60, 60, 70),
-        Text = "▶ " .. label,
-        TextColor3 = Color3.new(1, 1, 1),
-        TextSize = 13,
-        Font = Enum.Font.GothamBold,
-        AutoButtonColor = false,
-        BorderSizePixel = 0,
-    })
-    corner(btn, 6)
-
-    local statusLbl = mk(row, "TextLabel", {
-        Size = UDim2.new(1, -110, 0, 18),
-        Position = UDim2.fromOffset(106, 8),
-        BackgroundTransparency = 1,
-        Text = "Status: IDLE",
-        TextColor3 = color,
-        TextSize = 12,
-        Font = Enum.Font.Gotham,
-        TextXAlignment = Enum.TextXAlignment.Left,
-    })
-
-    local statLbl = mk(row, "TextLabel", {
-        Size = UDim2.new(1, -110, 0, 18),
-        Position = UDim2.fromOffset(106, 28),
-        BackgroundTransparency = 1,
-        Text = "",
-        TextColor3 = Color3.fromRGB(180, 190, 200),
-        TextSize = 11,
-        Font = Enum.Font.Gotham,
-        TextXAlignment = Enum.TextXAlignment.Left,
-    })
-
+local function mkToggle(parent, text, y, key)
+    mkLabel(parent, text, y)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.fromOffset(70, 22)
+    btn.Position = UDim2.new(1, -80, 0, y)
+    btn.BackgroundColor3 = CFG[key] and COLORS.On or COLORS.Off
+    btn.Text = CFG[key] and "ON" or "OFF"
+    btn.TextColor3 = COLORS.Text
+    btn.TextSize = 12
+    btn.Font = Enum.Font.GothamBold
+    btn.AutoButtonColor = false
+    btn.BorderSizePixel = 0
+    btn.ZIndex = 10
+    btn.Parent = parent
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
     btn.MouseButton1Click:Connect(function()
-        Config[key] = not Config[key]
-        if Config[key] then
-            btn.Text = "■ " .. label
-            btn.BackgroundColor3 = Color3.fromRGB(190, 50, 50)
-        else
-            btn.Text = "▶ " .. label
-            btn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
-            Status[key] = "IDLE"
+        CFG[key] = not CFG[key]
+        btn.Text = CFG[key] and "ON" or "OFF"
+        btn.BackgroundColor3 = CFG[key] and COLORS.On or COLORS.Off
+    end)
+    return btn
+end
+
+local function mkSlider(parent, text, y, min, max, initial, cb)
+    mkLabel(parent, text, y)
+    local val = Instance.new("TextLabel")
+    val.Size = UDim2.fromOffset(80, 18)
+    val.Position = UDim2.new(1, -90, 0, y)
+    val.BackgroundTransparency = 1
+    val.Text = string.format("%.2f", initial)
+    val.TextColor3 = COLORS.Text
+    val.TextSize = 12
+    val.Font = Enum.Font.GothamBold
+    val.TextXAlignment = Enum.TextXAlignment.Right
+    val.ZIndex = 10
+    val.Parent = parent
+
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(1, -20, 0, 6)
+    bar.Position = UDim2.fromOffset(10, y + 20)
+    bar.BackgroundColor3 = COLORS.SliderBg
+    bar.BorderSizePixel = 0
+    bar.ZIndex = 10
+    bar.Parent = parent
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(1, 0)
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.fromScale((initial - min) / (max - min), 1)
+    fill.BackgroundColor3 = COLORS.Slider
+    fill.BorderSizePixel = 0
+    fill.ZIndex = 10
+    fill.Parent = bar
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(14, 14)
+    knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    knob.Position = UDim2.new(fill.Size.X.Scale, 0, 0.5, 0)
+    knob.BackgroundColor3 = Color3.new(1,1,1)
+    knob.BorderSizePixel = 0
+    knob.ZIndex = 11
+    knob.Parent = bar
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local dragging = false
+    local function setX(x)
+        local ax = bar.AbsolutePosition.X
+        local w  = bar.AbsoluteSize.X
+        if w <= 0 then return end
+        local p = math.clamp((x - ax) / w, 0, 1)
+        local v = min + (max - min) * p
+        fill.Size = UDim2.fromScale(p, 1)
+        knob.Position = UDim2.new(p, 0, 0.5, 0)
+        val.Text = string.format("%.2f", v)
+        cb(v)
+    end
+    bar.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; setX(i.Position.X)
         end
     end)
-
-    return row, statusLbl, statLbl
+    UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+            or i.UserInputType == Enum.UserInputType.Touch) then
+            setX(i.Position.X)
+        end
+    end)
+    UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    return val
 end
 
-local _, statusS, statS = makeToggleRow("Sell", "SELL", Color3.fromRGB(255, 210, 90), Y_START)
-local _, statusH, statH = makeToggleRow("Harvest", "HARVEST", Color3.fromRGB(0, 230, 150), Y_START + (ROW_H + 4))
-local _, statusW, statW = makeToggleRow("Water", "WATER", Color3.fromRGB(90, 190, 255), Y_START + 2 * (ROW_H + 4))
+mkLabel(panel, "⚙ Auto Dodge Settings", 8, COLORS.Text, 14)
+mkToggle(panel, "Enabled",          32,  "Enabled")
+mkToggle(panel, "Anti-Feint",       66,  "AntiFeint")
+mkToggle(panel, "Feint Intercept",  100, "FeintIntercept")
+mkSlider(panel, "Margin (s)",       140, 0.02, 0.25, CFG.Margin,         function(v) CFG.Margin = v end)
+mkSlider(panel, "Cooldown (s)",     186, 0.005, 0.30, CFG.MinCooldown,   function(v) CFG.MinCooldown = v end)
+mkSlider(panel, "Arm Window (s)",   232, 0.3,  1.5,  CFG.FeintArmWindow,  function(v) CFG.FeintArmWindow = v end)
+mkToggle(panel, "Debug Log",        278, "Debug")
 
-local Y_NEXT = Y_START + 3 * (ROW_H + 4) + 8
+mkLabel(panel, "─ Stats ─", 320, COLORS.TextDim, 11)
+local sDodge = mkLabel(panel, "Dodges: 0",     342)
+local sPerf  = mkLabel(panel, "Perfect: 0",    362, COLORS.Perfect)
+local sInt   = mkLabel(panel, "Intercepts: 0", 382, COLORS.Intercept)
+local sPred  = mkLabel(panel, "Predictive: 0", 402, COLORS.Predictive)
+local sState = mkLabel(panel, "State: -",      422, COLORS.TextDim, 11)
 
-local cfgBox = mk(content, "Frame", {
-    Size = UDim2.new(1, -24, 0, 145),
-    Position = UDim2.fromOffset(12, Y_NEXT),
-    BackgroundColor3 = Color3.fromRGB(28, 34, 40),
-    BorderSizePixel = 0,
-})
-corner(cfgBox, 8)
+RunService.Heartbeat:Connect(function()
+    if not panel.Visible then return end
+    sDodge.Text = "Dodges: " .. stats.dodges
+    sPerf.Text  = "Perfect: " .. stats.perfects
+    sInt.Text   = "Intercepts: " .. stats.intercepts
+    sPred.Text  = "Predictive: " .. stats.predictives
+    local now = Workspace:GetServerTimeNow()
+    if now < feint.armedUntil then
+        sState.Text = string.format("🎯 ARMED %.2fs", feint.armedUntil - now)
+        sState.TextColor3 = COLORS.Intercept
+    elseif pendingDodge then
+        sState.Text = string.format("Queued %.2fs", math.max(0, pendingDodge.expires - now))
+        sState.TextColor3 = Color3.fromRGB(255, 180, 80)
+    else
+        sState.Text = "State: ready"
+        sState.TextColor3 = COLORS.TextDim
+    end
+end)
 
-local rangeLbl = mk(cfgBox, "TextLabel", {
-    Size = UDim2.new(1, -16, 0, 18),
-    Position = UDim2.fromOffset(8, 4),
-    BackgroundTransparency = 1,
-    Text = "Harvest Range: " .. Config.HarvestRange .. " studs",
-    TextColor3 = Color3.fromRGB(200, 210, 220),
-    TextSize = 12,
-    Font = Enum.Font.Gotham,
-    TextXAlignment = Enum.TextXAlignment.Left,
-})
-
-local rangeTrack = mk(cfgBox, "Frame", {
-    Size = UDim2.new(1, -16, 0, 6),
-    Position = UDim2.fromOffset(8, 26),
-    BackgroundColor3 = Color3.fromRGB(40, 44, 54),
-    BorderSizePixel = 0,
-})
-corner(rangeTrack, 3)
-local rangeFill = mk(rangeTrack, "Frame", {
-    Size = UDim2.new((Config.HarvestRange - 5) / 45, 0, 1, 0),
-    BackgroundColor3 = Color3.fromRGB(0, 200, 130),
-    BorderSizePixel = 0,
-})
-corner(rangeFill, 3)
-
-local function setRangeFromX(x)
-    local ap, as = rangeTrack.AbsolutePosition, rangeTrack.AbsoluteSize
-    if as.X <= 0 then return end
-    local t = math.clamp((x - ap.X) / as.X, 0, 1)
-    local v = math.floor(5 + t * 45)
-    Config.HarvestRange = v
-    Config.WaterRange = v + 10
-    rangeLbl.Text = "Harvest Range: " .. v .. " studs"
-    rangeFill.Size = UDim2.new(t, 0, 1, 0)
+-- ============ INTERACTIONS ============
+local function refreshToggle()
+    toggle.BackgroundColor3 = CFG.Enabled and COLORS.On or COLORS.Off
+    toggle.Text = CFG.Enabled and "✓" or "✕"
+    TS:Create(toggle, TweenInfo.new(0.15, Enum.EasingStyle.Back),
+        { Size = UDim2.fromOffset(TSIZE, TSIZE) }):Play()
 end
 
-local draggingRange = false
-rangeTrack.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        draggingRange = true
-        setRangeFromX(input.Position.X)
-    end
-end)
-UserInputService.InputChanged:Connect(function(input)
-    if draggingRange and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        setRangeFromX(input.Position.X)
-    end
-end)
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        draggingRange = false
-    end
+local function setEnabled(v)
+    CFG.Enabled = v and true or false
+    if not CFG.Enabled then pendingDodge = nil end
+    refreshToggle()
+    print("[AutoDodge]", CFG.Enabled and "✅ ON" or "❌ OFF")
+end
+
+toggle.MouseButton1Click:Connect(function()
+    setEnabled(not CFG.Enabled)
 end)
 
-local noclipBtn = mk(cfgBox, "TextButton", {
-    Size = UDim2.new(0, 140, 0, 26),
-    Position = UDim2.fromOffset(8, 44),
-    BackgroundColor3 = Color3.fromRGB(50, 60, 55),
-    Text = "Noclip: " .. (Config.Noclip and "ON" or "OFF"),
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 12,
-    Font = Enum.Font.Gotham,
-    AutoButtonColor = false,
-    BorderSizePixel = 0,
-})
-corner(noclipBtn, 5)
-noclipBtn.MouseButton1Click:Connect(function()
-    Config.Noclip = not Config.Noclip
-    noclipBtn.Text = "Noclip: " .. (Config.Noclip and "ON" or "OFF")
-    noclipBtn.BackgroundColor3 = Config.Noclip and Color3.fromRGB(50, 60, 55) or Color3.fromRGB(70, 50, 50)
-    if not Config.Noclip and LP.Character then
-        for _, part in ipairs(LP.Character:GetDescendants()) do
-            if part:IsA("BasePart") then part.CanCollide = true end
+gear.MouseButton1Click:Connect(function()
+    panel.Visible = not panel.Visible
+    gear.BackgroundColor3 = panel.Visible and COLORS.GearHi or COLORS.Gear
+end)
+
+-- drag both toggle + gear
+local drag = { active = false, moved = false, start = Vector2.zero, pos0 = nil }
+toggle.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+        drag.active = true
+        drag.moved = false
+        drag.start = Vector2.new(i.Position.X, i.Position.Y)
+        drag.pos0 = toggle.Position
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if drag.active and (i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch) then
+        local cur = Vector2.new(i.Position.X, i.Position.Y)
+        local d = cur - drag.start
+        if d.Magnitude > 6 then
+            drag.moved = true
+            toggle.Position = UDim2.fromOffset(drag.pos0.X.Offset + d.X, drag.pos0.Y.Offset + d.Y)
+            gear.Position = UDim2.fromOffset(
+                toggle.Position.X.Offset + (TSIZE - GSIZE) / 2,
+                toggle.Position.Y.Offset + TSIZE + 6
+            )
+            panel.Position = UDim2.fromOffset(
+                toggle.Position.X.Offset - 250,
+                toggle.Position.Y.Offset - 230
+            )
         end
     end
 end)
-
-local purgeBtn = mk(cfgBox, "TextButton", {
-    Size = UDim2.new(0, 140, 0, 26),
-    Position = UDim2.fromOffset(156, 44),
-    BackgroundColor3 = Color3.fromRGB(50, 55, 65),
-    Text = "Purge: " .. (Config.AutoPurge and "ON" or "OFF"),
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 12,
-    Font = Enum.Font.Gotham,
-    AutoButtonColor = false,
-    BorderSizePixel = 0,
-})
-corner(purgeBtn, 5)
-purgeBtn.MouseButton1Click:Connect(function()
-    Config.AutoPurge = not Config.AutoPurge
-    purgeBtn.Text = "Purge: " .. (Config.AutoPurge and "ON" or "OFF")
-    purgeBtn.BackgroundColor3 = Config.AutoPurge and Color3.fromRGB(120, 40, 40) or Color3.fromRGB(50, 55, 65)
-end)
-
-local rayBtn = mk(cfgBox, "TextButton", {
-    Size = UDim2.new(1, -16, 0, 26),
-    Position = UDim2.fromOffset(8, 76),
-    BackgroundColor3 = Color3.fromRGB(50, 60, 55),
-    Text = "Ray: " .. (Config.ShowRay and "ON" or "OFF"),
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 12,
-    Font = Enum.Font.Gotham,
-    AutoButtonColor = false,
-    BorderSizePixel = 0,
-})
-corner(rayBtn, 5)
-rayBtn.MouseButton1Click:Connect(function()
-    Config.ShowRay = not Config.ShowRay
-    rayBtn.Text = "Ray: " .. (Config.ShowRay and "ON" or "OFF")
-end)
-
-local statsBox = mk(content, "Frame", {
-    Size = UDim2.new(1, -24, 0, 60),
-    Position = UDim2.fromOffset(12, Y_NEXT + 153),
-    BackgroundColor3 = Color3.fromRGB(32, 38, 44),
-    BorderSizePixel = 0,
-})
-corner(statsBox, 6)
-
-local statTotal = mk(statsBox, "TextLabel", {
-    Size = UDim2.new(1, -16, 0, 22),
-    Position = UDim2.fromOffset(8, 6),
-    BackgroundTransparency = 1,
-    Text = "",
-    TextColor3 = Color3.fromRGB(0, 230, 150),
-    TextSize = 13,
-    Font = Enum.Font.GothamBold,
-    TextXAlignment = Enum.TextXAlignment.Left,
-})
-local statRuntime = mk(statsBox, "TextLabel", {
-    Size = UDim2.new(1, -16, 0, 20),
-    Position = UDim2.fromOffset(8, 30),
-    BackgroundTransparency = 1,
-    Text = "",
-    TextColor3 = Color3.fromRGB(150, 160, 180),
-    TextSize = 11,
-    Font = Enum.Font.Gotham,
-    TextXAlignment = Enum.TextXAlignment.Left,
-})
-
--- Drag
-local dragging, dragStart, startPos
-titleBar.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = true
-        dragStart = input.Position
-        startPos = root.Position
-    end
-end)
-UserInputService.InputChanged:Connect(function(input)
-    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        local d = input.Position - dragStart
-        root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
-    end
-end)
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = false
+UIS.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+        drag.active = false
     end
 end)
 
--- Live update
-task.spawn(function()
-    while gui.Parent do
-        statusS.Text = "Sell: " .. Status.Sell
-        statusH.Text = "Harvest: " .. Status.Harvest
-        statusW.Text = "Water: " .. Status.Water
-        statS.Text = "Sold runs: " .. Stats.Sold
-        statH.Text = "Harvested: " .. Stats.Harvested
-        statW.Text = "Watered: " .. Stats.Watered
-        statTotal.Text = string.format("✓ %d  💧 %d  💰 %d", Stats.Harvested, Stats.Watered, Stats.Sold)
-        statRuntime.Text = "Runtime: " .. math.floor(tick() - Stats.StartTime) .. "s"
-        task.wait(0.25)
-    end
-end)
+-- ==========================================================
+--  PUBLIC API
+-- ==========================================================
+_G.AutoDodge = {
+    Toggle            = function() setEnabled(not CFG.Enabled); return CFG.Enabled end,
+    Enable            = function() setEnabled(true)  end,
+    Disable           = function() setEnabled(false) end,
+    SetMargin         = function(m) CFG.Margin = m end,
+    SetCooldown       = function(c) CFG.MinCooldown = c end,
+    SetPingOffset     = function(o) CFG.ManualPingOffset = o end,
+    SetAntiFeint      = function(v) CFG.AntiFeint = v end,
+    SetFeintIntercept = function(v) CFG.FeintIntercept = v end,
+    SetArmWindow      = function(w) CFG.FeintArmWindow = w end,
+    Debug             = function(v) CFG.Debug = v end,
+    Config            = CFG,
+    Stats             = stats,
+    Feint             = feint,
+    GUI               = gui,
+}
 
-UserInputService.InputBegan:Connect(function(input, gp)
-    if gp then return end
-    if input.KeyCode == Enum.KeyCode.F8 then
-        local on = not (Config.Harvest or Config.Water or Config.Sell)
-        Config.Harvest, Config.Water, Config.Sell = on, on, on
-        for _, row in ipairs(content:GetChildren()) do
-            if row:IsA("Frame") and row.BackgroundColor3 == Color3.fromRGB(32, 40, 46) then
-                local btn = row:FindFirstChildWhichIsA("TextButton")
-                if btn then
-                    if on then
-                        btn.BackgroundColor3 = Color3.fromRGB(190, 50, 50)
-                        if btn.Text:sub(1, 1) ~= "■" then btn.Text = "■ " .. btn.Text:sub(3) end
-                    else
-                        btn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
-                        if btn.Text:sub(1, 1) ~= "▶" then btn.Text = "▶ " .. btn.Text:sub(3) end
-                    end
-                end
-            end
-        end
-    end
-end)
-
-print("[AutoFarm V7] โหลดเสร็จ — ระบบเดินแบบ Non-Blocking ทำงานได้ 100%")
+print("[AutoDodge V6] ✅ Loaded")
+print("  • คลิกปุ่มวงกลม = toggle ON/OFF")
+print("  • คลิกเฟือง = เปิด settings")
+print("  • ลาก = ย้ายตำแหน่ง")
+print("  • Close-range fixed: Margin 0.12 + DASH_WINDOW 0.22")
