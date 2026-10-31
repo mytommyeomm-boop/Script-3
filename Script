@@ -1,830 +1,1021 @@
---[[ ============================================================
-    AUTO DODGE V6 — FINAL
-    ------------------------------------------------------------
-    • Close-range fixed: Margin 0.12 (mid-window) + DASH_WINDOW 0.22
-    • Per-punch cooldown bypass (combo ต่อเนื่อง)
-    • Priority chain: Perfect flag > NeededDirection > Predictive
-    • Fast retry 8ms + RenderStepped (ไม่รอ Heartbeat)
-    • Feint Intercept (ก้างทาง) — armed 0.85s หลัง feint
-    • GUI 2 ปุ่มแยก: toggle + gear (ไม่หาย)
-    ============================================================ ]]
+--[[
+    ═══════════════════════════════════════════════════════════
+    AUTO SUITE v3 (Rayfield) — Full Build
+    ═══════════════════════════════════════════════════════════
+    
+    ✓ Auto Catch (Aggressive 100% mode)
+    ✓ Ship Speed (AttributeHook + CFrame override)
+    ✓ Code Redeemer (Manual / Batch / Scan / Presets)
+    ✓ Code Hunter (ดึง Config + Hook response)
+    ✓ Status Dashboard
+    
+    Keybind: F = AutoCatch toggle
+    API: _G.Suite
+    
+    ต้องมี:
+      - Executor ที่ loadstring / HttpGet / hookmetamethod ได้
+      - อยู่ในเกมที่มี shared config ตรงกับ source
+]]
 
+-- ============================================================
+-- SERVICES
+-- ============================================================
+local Players           = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService  = game:GetService("UserInputService")
 local Workspace         = game:GetService("Workspace")
 local RunService        = game:GetService("RunService")
-local Players           = game:GetService("Players")
-local UIS               = game:GetService("UserInputService")
-local TS                = game:GetService("TweenService")
+local LocalPlayer       = Players.LocalPlayer
 
-local LP        = Players.LocalPlayer
-local PGui      = LP:WaitForChild("PlayerGui")
-local ForceDash = ReplicatedStorage:WaitForChild("Events"):WaitForChild("ForceDash")
-local Styles    = require(ReplicatedStorage.Modules:WaitForChild("Styles"))
-
--- ==========================================================
---  CONFIG
--- ==========================================================
-local CFG = {
-    Enabled             = false,
-    Margin              = 0.12,      -- mid-window
-    MinCooldown         = 0.015,     -- rapid punch
-    StrictSide          = true,
-    OnlyWhenTargeted    = true,
-    AntiFeint           = true,
-    FeintIntercept      = true,
-    FeintArmWindow      = 0.85,
-    LatencyCompensation = true,
-    ManualPingOffset    = nil,
-    Debug               = false,
-}
-
-local DASH_WINDOW = 0.22             -- perfect window (server ~0.22s)
-
--- ==========================================================
---  STATE
--- ==========================================================
-local lastDodgeTime   = 0
-local lastDodgePunchId = nil
-local opponent        = nil
-local oppConns        = {}
-local myConns         = {}
-local alternateSide   = "Left"
-local punchStates     = {}
-local pendingDodge    = nil
-local feint = {
-    count = 0, lastAt = 0, armedUntil = 0, armedDirection = nil,
-}
-local stats = { dodges = 0, perfects = 0, intercepts = 0, predictives = 0 }
-
-local function log(...)
-    if CFG.Debug then print("[Dodge]", ...) end
-end
-
--- ==========================================================
---  HELPERS
--- ==========================================================
-local function getState(n)
-    local s = Workspace:FindFirstChild("States")
-    return s and s:FindFirstChild(n)
-end
-local function getMyCD()  local s = getState(LP.Name); return s and s:FindFirstChild("CharacterData") end
-local function getMyOcc() local s = getState(LP.Name); return s and s:FindFirstChild("Occupied") end
-
-local function canDash()
-    local c = LP.Character
-    if not (c and c.PrimaryPart) then return false end
-    local o = getMyOcc(); if not o then return false end
-    if o.Dashing.Value then return false end
-    local d = getMyCD(); if not d then return false end
-    if d.Stunned.Value or d.Cutscene.Value then return false end
-    if d.Stamina.Value <= 1 then return false end
-    if c:GetAttribute("RiceballChanneling") then return false end
-    if c:GetAttribute("NoDash") then return false end
-    return true
-end
-
-local function getNeededDirection()
-    local c = LP.Character; if not c then return nil end
-    local dir = c:GetAttribute("NeededDirection")
-    if dir == "Left" or dir == "Right" or dir == "Forward" or dir == "Backward" then
-        return dir
-    end
-    return nil
-end
-
-local function computeSideDirection()
-    local c = LP.Character
-    if not (c and c.PrimaryPart) then return alternateSide end
-    local o = getMyOcc()
-    local locked = o and o.LockedOn.Value
-    if locked and locked.PrimaryPart then
-        local away = (c.PrimaryPart.Position - locked.PrimaryPart.Position) * Vector3.new(1,0,1)
-        if away.Magnitude > 0.1 then
-            away = away.Unit
-            local side = Vector3.new(away.Z, 0, -away.X)
-            local look = c.PrimaryPart.CFrame.LookVector * Vector3.new(1,0,1)
-            if look.Magnitude > 0.1 then
-                return side:Dot(look.Unit) > 0 and "Right" or "Left"
-            end
-        end
-    end
-    return alternateSide
-end
-
-local function isOppFeinting(opp)
-    if not opp then return false end
-    return opp:GetAttribute("IsFeinting") == true
-        or opp:GetAttribute("LocalIsFeinting") == true
-end
-
-local function getOppHitDirection(opp)
-    if not opp then return nil end
-    local os = getState(opp.Name); if not os then return nil end
-    local pd = os:FindFirstChild("PlayerData")
-    local occ = os:FindFirstChild("Occupied")
-    if not (pd and occ) then return nil end
-    local sv = pd:FindFirstChild("Style"); if not sv then return nil end
-    local style = Styles[sv.Value]; if not style then return nil end
-
-    local isHeavy = opp:GetAttribute("IsHeavy") == true
-    local comboId = 1
-    local cc = occ:FindFirstChild("CurrentCombo"); if cc then comboId = cc.Value end
-    local punchNum = 1
-    local cp = occ:FindFirstChild("CurrentPunch"); if cp then punchNum = cp.Value end
-
-    if isHeavy then
-        local ha = style.HeavyAttacks
-        if ha and ha[punchNum] and ha[punchNum].HitInfo then
-            return ha[punchNum].HitInfo.Direction
-        end
-    else
-        local combo = style.Combos[comboId]
-        if combo then
-            local hit = combo[punchNum]
-            if hit and hit.HitInfo and hit.HitInfo.Direction then
-                return hit.HitInfo.Direction
-            end
-            if combo.DefaultPunchInfo and combo.DefaultPunchInfo.HitInfo then
-                return combo.DefaultPunchInfo.HitInfo.Direction
-            end
-        end
-    end
-    return nil
-end
-
-local function hitDirToDodge(hitDir)
-    if not hitDir then return nil end
-    if hitDir == "Left" or hitDir == "BodyLeft" then return "Right"
-    elseif hitDir == "Right" or hitDir == "BodyRight" then return "Left"
-    elseif hitDir == "Forward" or hitDir == "BodyForward" then return alternateSide
-    end
-    return nil
-end
-
-local function getPingOffset()
-    if CFG.ManualPingOffset then return CFG.ManualPingOffset end
-    if not CFG.LatencyCompensation then return 0 end
-    return math.clamp((LP:GetNetworkPing() or 0) / 2, 0.02, 0.10)
-end
-
--- ==========================================================
---  DASH — per-punch bypass
--- ==========================================================
-local function executeDash(dir, isIntercept, isPredictive)
-    lastDodgeTime = Workspace:GetServerTimeNow()
-    ForceDash:Fire({ Direction = dir, IgnoreStun = false })
-    if dir == "Left"  then alternateSide = "Right"
-    elseif dir == "Right" then alternateSide = "Left" end
-    stats.dodges = stats.dodges + 1
-    if isIntercept  then stats.intercepts  = stats.intercepts + 1  end
-    if isPredictive then stats.predictives = stats.predictives + 1 end
-    log("DASH →", dir,
-        isIntercept and "(INTERCEPT)" or isPredictive and "(PRED)" or "")
-
-    task.spawn(function()
-        local deadline = lastDodgeTime + 0.2
-        while Workspace:GetServerTimeNow() < deadline do
-            local c = LP.Character
-            if c and c:GetAttribute("Perfect") then
-                stats.perfects = stats.perfects + 1
-                return
-            end
-            task.wait(0.01)
-        end
+-- ============================================================
+-- RAYFIELD
+-- ============================================================
+local Rayfield
+do
+    local ok, res = pcall(function()
+        return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
     end)
+    if not ok or not res then
+        warn("[Suite] โหลด Rayfield ไม่ได้: " .. tostring(res))
+        return
+    end
+    Rayfield = res
+end
+
+-- ============================================================
+-- SHARED CONFIG
+-- ============================================================
+local Shared = ReplicatedStorage:WaitForChild("Shared", 15)
+if not Shared then
+    Rayfield:Notify({ Title = "Suite", Content = "โหลด Shared ไม่ได้", Duration = 5 })
+    return
+end
+
+local Config = Shared:WaitForChild("Config", 10)
+local ok1, Creatures    = pcall(require, Config:WaitForChild("Creatures"))
+local ok2, CatchShot    = pcall(require, Config:WaitForChild("CatchShot"))
+local ok3, CatchVisual  = pcall(require, Config:WaitForChild("CatchVisual"))
+local ok4, CreatureRide = pcall(require, Config:WaitForChild("CreatureRide"))
+local ok5, PlayerShip   = pcall(require, Config:WaitForChild("PlayerShip"))
+local ok6, Net          = pcall(require, Shared:WaitForChild("Net"))
+
+if not (ok1 and ok2 and ok3 and ok4 and ok6) then
+    Rayfield:Notify({
+        Title = "Suite",
+        Content = "require Config บางตัวล้มเหลว — สคริปต์อาจไม่ work",
+        Duration = 8,
+    })
+end
+
+local Control   = (ok3 and CatchVisual.Control) or { AssistMaxAngleDegrees = 45, ClientMinGapSeconds = 0.3 }
+local Throw     = (ok2 and CatchShot.Throw) or { MaxRangeStuds = 200, ThrowsPerMinute = 60 }
+local TierOrder = (ok2 and CatchShot.TierOrder) or { "iron", "heavy", "spread", "rainbow" }
+local RiderAttr = (ok4 and CreatureRide.RiderAttribute) or "RiderUserId"
+
+local RemotesFolder    = ReplicatedStorage:FindFirstChild(Net and Net.FolderName or "Remotes")
+local CatchThrowRemote = RemotesFolder and RemotesFolder:FindFirstChild(Net and Net.CatchThrow or "CatchThrow")
+
+-- ============================================================
+-- GLOBAL
+-- ============================================================
+local stats = {
+    caught = 0, failed = 0, blocked = 0, lastReason = "-",
+    codesTried = 0, codesOK = 0, speedFrames = 0,
+}
+local function log(m) print("[Suite] " .. m) end
+
+-- ============================================================
+-- ═══════════════════ AUTO CATCH ════════════════════════════
+-- ============================================================
+local catchState = {
+    running = false,
+    lastThrow = 0,
+    history = {},
+    targetLock = nil,
+    targetLockUntil = 0,
+    settings = {
+        Interval    = 0.05,
+        MaxAngle    = 180,
+        MaxRange    = 500,
+        PreferTier  = "auto",
+        SkipHeld    = false,
+        Aggressive  = true,
+        LockTarget  = true,
+        AutoEnable  = true,
+        RotateTier  = true,
+    },
+}
+
+local function readBag()
+    local c = {}
+    for _, t in TierOrder do c[t] = 0 end
+    local s = LocalPlayer:GetAttribute("CatchBalls")
+    if type(s) ~= "string" then return c end
+    local i = 1
+    for n in string.gmatch(s, "[^,]+") do
+        if TierOrder[i] then c[TierOrder[i]] = tonumber(n) or 0 end
+        i += 1
+    end
+    return c
+end
+
+local function pickTier(counts)
+    if catchState.settings.PreferTier ~= "auto"
+        and (counts[catchState.settings.PreferTier] or 0) > 0 then
+        return catchState.settings.PreferTier
+    end
+    for i = #TierOrder, 1, -1 do
+        if (counts[TierOrder[i]] or 0) > 0 then
+            return TierOrder[i]
+        end
+    end
+    return nil
+end
+
+local function catchPlayerReady()
+    if LocalPlayer:GetAttribute("CatchOn") ~= true then
+        if catchState.settings.AutoEnable then
+            pcall(function() LocalPlayer:SetAttribute("CatchOn", true) end)
+        end
+        if LocalPlayer:GetAttribute("CatchOn") ~= true then
+            return false, "โหมดจับปิด"
+        end
+    end
+    if LocalPlayer:GetAttribute(RiderAttr) == true then return false, "ขี่สัตว์" end
+    if LocalPlayer:GetAttribute("IslandVisitState") ~= nil then return false, "เยี่ยมเกาะ" end
+    local ch = LocalPlayer.Character
+    local h  = ch and ch:FindFirstChildOfClass("Humanoid")
+    if not h or h.Health <= 0 then return false, "ตาย" end
+    if not ch:FindFirstChild("HumanoidRootPart") then return false, "ไม่มี RootPart" end
     return true
 end
 
-local function tryDash(dir, isIntercept, punchId, isPredictive)
-    if not dir then return false end
-    local now = Workspace:GetServerTimeNow()
-
-    if not canDash() then
-        pendingDodge = {
-            dir = dir, expires = now + 0.4,
-            intercept = isIntercept, punchId = punchId, predictive = isPredictive,
-        }
-        return false
+local function catchableV2(m)
+    if not m:IsA("Model") or not m.PrimaryPart then return false end
+    if not m:IsDescendantOf(Workspace) then return false end
+    if m:GetAttribute("CatchGhost") == true then return false end
+    if m:GetAttribute("RoundHidden") == true then return false end
+    if type(m:GetAttribute("SlotId")) ~= "string" then return false end
+    if catchState.settings.SkipHeld then
+        local now = Workspace:GetServerTimeNow()
+        local h = m:GetAttribute("CatchHeldUntil")
+        if type(h) == "number" and now < h then return false end
+        local st = m:GetAttribute("BossStunUntil")
+        if type(st) == "number" and now < st then return false end
     end
-
-    -- per-punch cooldown bypass
-    local isNewPunch = punchId and punchId ~= lastDodgePunchId
-    if not isNewPunch and now - lastDodgeTime < CFG.MinCooldown then
-        pendingDodge = {
-            dir = dir, expires = now + 0.4,
-            intercept = isIntercept, punchId = punchId, predictive = isPredictive,
-        }
-        return false
-    end
-
-    lastDodgePunchId = punchId
-    return executeDash(dir, isIntercept, isPredictive)
+    return true
 end
 
--- ==========================================================
---  FEINT INTERCEPT (ก้างทาง)
--- ==========================================================
-local function armFeintIntercept(opp)
-    local guess = hitDirToDodge(getOppHitDirection(opp))
-    feint.count = feint.count + 1
-    feint.lastAt = Workspace:GetServerTimeNow()
-    feint.armedUntil = feint.lastAt + CFG.FeintArmWindow
-    feint.armedDirection = guess
-    pendingDodge = nil
-    if opponent then
-        local cpId = opponent:GetAttribute("CurrentPunchId") or 0
-        if punchStates[cpId] then punchStates[cpId].cancelled = true end
+local function findTargetV2(cam, myPos)
+    if catchState.settings.LockTarget
+        and catchState.targetLock
+        and os.clock() < catchState.targetLockUntil
+        and catchState.targetLock.Parent
+        and catchableV2(catchState.targetLock) then
+        return catchState.targetLock
     end
-    log("FEINT armed →", guess or "?", "win", CFG.FeintArmWindow)
+
+    local camP = cam.CFrame.Position
+    local look = cam.CFrame.LookVector
+    local best, bestScore = nil, math.huge
+    for _, m in CollectionService:GetTagged(Creatures.CreatureTag) do
+        if not catchableV2(m) then continue end
+        local pos = m:GetPivot().Position
+        local d   = (pos - myPos).Magnitude
+        if d > catchState.settings.MaxRange then continue end
+        local u = (pos - camP).Unit
+        local a = math.deg(math.acos(math.clamp(look:Dot(u), -1, 1)))
+        if a > catchState.settings.MaxAngle then continue end
+        local s = a * 0.5 + d * 0.1
+        if s < bestScore then bestScore, best = s, m end
+    end
+    if best and catchState.settings.LockTarget then
+        catchState.targetLock = best
+        catchState.targetLockUntil = os.clock() + 3
+    end
+    return best
 end
 
-local function isInterceptArmed()
-    return CFG.FeintIntercept and Workspace:GetServerTimeNow() < feint.armedUntil
+local function fireCatch(target, tier)
+    if not CatchThrowRemote then return false end
+    local ok = pcall(function()
+        CatchThrowRemote:FireServer({
+            tier   = tier,
+            target = target:GetAttribute("SlotId"),
+            aim    = target:GetPivot().Position,
+        })
+    end)
+    if ok then
+        stats.caught += 1
+        table.insert(catchState.history, os.clock())
+        return true
+    end
+    stats.failed += 1
+    return false
 end
 
-local function tryIntercept()
-    if not isInterceptArmed() then return end
-    if not opponent then return end
+local function catchLoopV2()
+    log("AutoCatch v2 (Aggressive): เริ่ม")
+    local lastTierRotate = 0
+    local tierIdx = #TierOrder
 
-    local cpId = opponent:GetAttribute("CurrentPunchId") or 0
-    local state = punchStates[cpId]
-    if state and state.dodged then return end
+    while catchState.running do
+        task.wait(0.01)
+        local ready, reason = catchPlayerReady()
+        if not ready then stats.lastReason = reason; continue end
+        if os.clock() - catchState.lastThrow < catchState.settings.Interval then continue end
 
-    local nd = getNeededDirection()
-    if nd then
-        if tryDash(nd, true, cpId) then
-            punchStates[cpId] = punchStates[cpId] or { startTime = Workspace:GetServerTimeNow() }
-            punchStates[cpId].dodged = true
-            feint.armedUntil = 0
+        local bag = readBag()
+        local tier = pickTier(bag)
+
+        if catchState.settings.RotateTier and tier then
+            if os.clock() - lastTierRotate > 0.5 then
+                lastTierRotate = os.clock()
+                tierIdx = tierIdx - 1
+                if tierIdx < 1 then tierIdx = #TierOrder end
+                if (bag[TierOrder[tierIdx]] or 0) > 0 then
+                    tier = TierOrder[tierIdx]
+                end
+            end
         end
+
+        if not tier then stats.lastReason = "ไม่มีลูกบอล"; continue end
+
+        local cam = Workspace.CurrentCamera
+        local ch  = LocalPlayer.Character
+        local rt  = ch and ch:FindFirstChild("HumanoidRootPart")
+        if not cam or not rt then continue end
+
+        local t = findTargetV2(cam, rt.Position)
+        if not t then stats.lastReason = "ไม่เจอเป้า"; continue end
+
+        if fireCatch(t, tier) then
+            catchState.lastThrow = os.clock()
+            stats.lastReason = "ยิง"
+        else
+            stats.lastReason = "rate limit (server)"
+        end
+    end
+    log("AutoCatch v2: หยุด")
+end
+
+-- ============================================================
+-- ═══════════════════ SHIP SPEED ════════════════════════════
+-- ============================================================
+local shipState = {
+    enabled       = false,
+    multiplier    = 3,
+    method        = "AttributeHook",
+    ship          = nil,
+    hookInstalled = false,
+    lastPos       = nil,
+    lastTime      = 0,
+    spamRemote    = nil,
+    lastSpam      = 0,
+}
+
+local function findOwnShip()
+    for _, m in Workspace:GetChildren() do
+        if m:IsA("Model")
+            and m:GetAttribute("PlayerShip") == true
+            and m:GetAttribute("ShipOwner") == LocalPlayer.UserId then
+            return m
+        end
+    end
+    return nil
+end
+
+-- ====== AttributeHook ======
+local function installAttributeHook()
+    if shipState.hookInstalled then return true end
+    if not hookmetamethod then return false end
+
+    local ok = pcall(function()
+        local oldIdx
+        oldIdx = hookmetamethod(game, "__index", function(self, key)
+            local result = oldIdx(self, key)
+
+            if key == "GetAttribute" and typeof(self) == "Instance" then
+                return function(inst, attr)
+                    if attr == "ShipSpeed"
+                        and shipState.enabled
+                        and shipState.method ~= "CFrame"
+                        and typeof(inst) == "Instance"
+                        and inst:IsA("Model")
+                        and inst:GetAttribute("ShipOwner") == LocalPlayer.UserId then
+                        local real = result(inst, attr)
+                        if type(real) == "number" then
+                            return real * shipState.multiplier
+                        end
+                    end
+                    return result(inst, attr)
+                end
+            end
+            return result
+        end)
+    end)
+
+    if ok then
+        shipState.hookInstalled = true
+        log("Ship: AttributeHook ติดตั้งแล้ว (mult = " .. shipState.multiplier .. ")")
+        return true
+    end
+    return false
+end
+
+-- ====== CFrame Override ======
+local function applyCFrame(dt)
+    local ship = shipState.ship or findOwnShip()
+    if not ship then return end
+    shipState.ship = ship
+
+    local speed = ship:GetAttribute("ShipSpeed") or 0
+    if math.abs(speed) < 0.5 then
+        shipState.lastPos = nil
         return
     end
 
-    local landTime = opponent:GetAttribute("LandTime")
-    if landTime then
-        local now    = Workspace:GetServerTimeNow()
-        local offset = getPingOffset()
-        local left   = landTime - now
-        if left <= (offset + CFG.Margin) and left >= -0.08 then
-            local dir = feint.armedDirection or computeSideDirection()
-            if tryDash(dir, true, cpId) then
-                punchStates[cpId] = punchStates[cpId] or {}
-                punchStates[cpId].dodged = true
-                feint.armedUntil = 0
+    local now = os.clock()
+    if shipState.lastPos and shipState.lastTime > 0 then
+        local elapsed = now - shipState.lastTime
+        if elapsed > 0 and elapsed < 0.5 then
+            local pv   = ship:GetPivot()
+            local look = pv.LookVector
+            local flat = Vector3.new(look.X, 0, look.Z)
+            if flat.Magnitude > 0.001 then
+                flat = flat.Unit
+                local boost = speed * (shipState.multiplier - 1) * elapsed
+                ship:PivotTo(pv + flat * boost)
+                stats.speedFrames += 1
             end
         end
     end
+    shipState.lastPos = ship:GetPivot().Position
+    shipState.lastTime = now
 end
 
--- ==========================================================
---  PUNCH TRACKING
--- ==========================================================
-local function onPunch(opp, forceHeavy)
-    if not CFG.Enabled then return end
-    if CFG.OnlyWhenTargeted then
-        local os  = getState(opp.Name)
-        local occ = os and os:FindFirstChild("Occupied")
-        local tgt = occ and occ:FindFirstChild("LockedOn")
-        if tgt and tgt.Value ~= LP.Character then return end
+-- ====== Spam remote ======
+local function findShipSpamRemote()
+    if shipState.spamRemote then return shipState.spamRemote end
+    if not RemotesFolder then return nil end
+    for _, r in RemotesFolder:GetDescendants() do
+        if not (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then continue end
+        local l = string.lower(r.Name)
+        if string.find(l, "helm") or string.find(l, "shipmove")
+            or string.find(l, "shipinput") or string.find(l, "shipcontrol") then
+            shipState.spamRemote = r
+            return r
+        end
     end
-    local id = opp:GetAttribute("CurrentPunchId") or 0
-    punchStates[id] = {
-        dodged    = false,
-        cancelled = false,
-        startTime = Workspace:GetServerTimeNow(),
-        isHeavy   = forceHeavy or (opp:GetAttribute("IsHeavy") == true),
+    return nil
+end
+
+local function applySpam(now)
+    if now - shipState.lastSpam < 0.05 then return end
+    shipState.lastSpam = now
+    local r = findShipSpamRemote()
+    if not r then return end
+    for _, p in { { helm = { throttle = 1, steer = 0 } },
+                  { throttle = 1, steer = 0 },
+                  { x = 0, z = 1 } } do
+        pcall(function()
+            if r:IsA("RemoteEvent") then r:FireServer(p) else r:InvokeServer(p) end
+        end)
+    end
+end
+
+RunService.Heartbeat:Connect(function(dt)
+    if not shipState.enabled then return end
+    if shipState.method == "CFrame" or shipState.method == "Hybrid" then
+        applyCFrame(dt)
+    end
+    if shipState.method == "Spam" or shipState.method == "Hybrid" then
+        applySpam(os.clock())
+    end
+end)
+
+-- ============================================================
+-- ═══════════════════ CODE REDEEMER ═════════════════════════
+-- ============================================================
+local codeState = {
+    remote   = nil,
+    cooldown = 1.5,
+    lastFire = 0,
+    results  = {},
+    presets  = {
+        "WELCOME", "LAUNCH", "BETA", "THANKYOU", "PETS", "ISLAND",
+        "PIRATE", "UPDATE", "NEWYEAR", "100K", "1M", "FREEBALL",
+        "SEASON", "LUCKY", "CREW", "BOAT", "GIFT", "FREE", "ENJOY",
+        "FISHING", "PETGAME", "THAILAND", "SIAM", "CREATURE",
+    },
+}
+
+local function findRedeemRemote()
+    if codeState.remote then return codeState.remote end
+    if not RemotesFolder then return nil end
+    local names = { "RedeemAct", "RedeemQuery", "CodeAct", "CodeRedeem", "RedeemCode" }
+    if type(Net and Net.RedeemAct) == "string" then table.insert(names, Net.RedeemAct) end
+    if type(Net and Net.SettingsAct) == "string" then table.insert(names, Net.SettingsAct) end
+    for _, n in names do
+        local r = RemotesFolder:FindFirstChild(n)
+        if r and (r:IsA("RemoteFunction") or r:IsA("RemoteEvent")) then
+            codeState.remote = r
+            return r
+        end
+    end
+    for _, r in RemotesFolder:GetChildren() do
+        if not (r:IsA("RemoteFunction") or r:IsA("RemoteEvent")) then continue end
+        local l = string.lower(r.Name)
+        if string.find(l, "redeem") or string.find(l, "code") or string.find(l, "gift") then
+            codeState.remote = r
+            return r
+        end
+    end
+    return nil
+end
+
+local function scanMapCodes()
+    local found, seen = {}, {}
+    local function add(c)
+        if type(c) == "string" and #c >= 3 and #c <= 40 and not seen[c] then
+            seen[c] = true
+            table.insert(found, c)
+        end
+    end
+    local function scan(root)
+        if not root then return end
+        for _, o in root:GetDescendants() do
+            if o:IsA("StringValue") and o.Value ~= "" then
+                local n = string.lower(o.Name)
+                if string.find(n, "code") or string.find(n, "redeem") then add(o.Value) end
+            elseif o:IsA("BasePart") and o:GetAttribute("IsCode") == true then
+                add(o:GetAttribute("Code") or o.Name)
+            elseif o:IsA("TextLabel") and o:GetAttribute("IsCode") == true then
+                add(o.Text)
+            elseif o:IsA("Model") and o:GetAttribute("IsCode") == true then
+                add(o:GetAttribute("Code") or o.Name)
+            end
+        end
+    end
+    scan(Workspace)
+    scan(ReplicatedStorage)
+    return found
+end
+
+local function redeemCode(code)
+    local r = findRedeemRemote()
+    if not r then return false, "ไม่พบ remote" end
+    local payloads = {
+        { code = code }, { Code = code }, { codeText = code },
+        { kind = "code", code = code },
+        { action = "redeem", code = code },
+        { code = code, quiet = true },
     }
-    log("punch id=", id, "heavy=", tostring(punchStates[id].isHeavy))
-
-    local now = Workspace:GetServerTimeNow()
-    for k, v in pairs(punchStates) do
-        if k ~= id and (now - v.startTime) > 3 then punchStates[k] = nil end
+    for _, p in payloads do
+        local ok, res
+        if r:IsA("RemoteFunction") then
+            ok, res = pcall(function() return r:InvokeServer(p) end)
+        else
+            ok, res = pcall(function() r:FireServer(p) end)
+            if ok then res = "sent" end
+        end
+        if ok and res ~= nil then
+            local success = false
+            if type(res) == "boolean" then success = res
+            elseif type(res) == "table" then success = res.ok == true or res.success == true
+            elseif type(res) == "string" then success = res ~= "" and res ~= "false" end
+            if success then return true, tostring(res) end
+        end
     end
-
-    if isInterceptArmed() then tryIntercept() end
+    return false, "ล้มเหลว"
 end
 
--- ==========================================================
---  MAIN DODGE LOGIC — Priority Chain
--- ==========================================================
-local function tryDodgeForCurrentPunch()
-    if not CFG.Enabled then return end
-    if not opponent then return end
-    if CFG.AntiFeint and isOppFeinting(opponent) then return end
-
-    if isInterceptArmed() then
-        tryIntercept()
-        return
+local function redeemBatch(list, cb)
+    codeState.results = {}
+    for i, code in list do
+        local wait = codeState.cooldown - (os.clock() - codeState.lastFire)
+        if wait > 0 then task.wait(wait) end
+        codeState.lastFire = os.clock()
+        stats.codesTried += 1
+        local ok, resp = redeemCode(code)
+        if ok then stats.codesOK += 1 end
+        table.insert(codeState.results, { code = code, ok = ok, resp = resp })
+        if cb then cb(i, #list, code, ok, resp) end
     end
+end
 
-    local cpId = opponent:GetAttribute("CurrentPunchId") or 0
-    local state = punchStates[cpId]
-    if state and (state.dodged or state.cancelled) then return end
+-- ============================================================
+-- ═══════════════════ CODE HUNTER ═══════════════════════════
+-- ============================================================
+local function inspectRedeemConfig()
+    local RS = game:GetService("ReplicatedStorage")
+    local SC = RS:FindFirstChild("Shared")
+    local C  = SC and SC:FindFirstChild("Config")
+    local R  = C and C:FindFirstChild("Redeem")
+    if not R or not R:IsA("ModuleScript") then return nil, "ไม่พบ Shared.Config.Redeem" end
+    local ok, cfg = pcall(require, R)
+    if not ok then return nil, "require ล้มเหลว: " .. tostring(cfg) end
+    return cfg, nil
+end
 
-    local char = LP.Character
-    if not char then return end
-
-    -- ═══ P1: Perfect flag SET ═══
-    if char:GetAttribute("Perfect") then
-        local nd = getNeededDirection()
-        if nd and tryDash(nd, false, cpId) then
-            punchStates[cpId] = punchStates[cpId] or { startTime = Workspace:GetServerTimeNow() }
-            punchStates[cpId].dodged = true
-            log("★ PERFECT (flag) →", nd)
-        end
-        return
-    end
-
-    -- ═══ P2: NeededDirection set ═══
-    local nd = getNeededDirection()
-    if nd then
-        if tryDash(nd, false, cpId) then
-            punchStates[cpId] = punchStates[cpId] or { startTime = Workspace:GetServerTimeNow() }
-            punchStates[cpId].dodged = true
-            log("★ ND instant →", nd)
-        end
-        return
-    end
-
-    -- ═══ P3: Predictive (LandTime mid-window + HitInfo) ═══
-    local landTime = opponent:GetAttribute("LandTime")
-    if landTime then
-        local now    = Workspace:GetServerTimeNow()
-        local offset = getPingOffset()
-        local windowStart = landTime - DASH_WINDOW - offset
-        if now >= windowStart and now <= (landTime - 0.02) then
-            local d = hitDirToDodge(getOppHitDirection(opponent)) or computeSideDirection()
-            if CFG.StrictSide and (d == "Forward" or d == "Backward") then
-                d = computeSideDirection()
-            end
-            if tryDash(d, false, cpId, true) then
-                punchStates[cpId] = punchStates[cpId] or { startTime = now }
-                punchStates[cpId].dodged = true
-                log("★ Predictive →", d)
-            end
+local function dumpConfig(cfg, prefix)
+    prefix = prefix or ""
+    if type(cfg) ~= "table" then return end
+    for k, v in pairs(cfg) do
+        local line = prefix .. tostring(k) .. " (" .. type(v) .. ")"
+        if type(v) == "string" and #v <= 40 then line = line .. " = " .. v
+        elseif type(v) == "number" or type(v) == "boolean" then line = line .. " = " .. tostring(v) end
+        print(line)
+        if type(v) == "table" and prefix:len() < 30 then
+            dumpConfig(v, prefix .. tostring(k) .. ".")
         end
     end
 end
 
--- ==========================================================
---  FAST RETRY (8ms) — pending queue
--- ==========================================================
+local function findRedeemRemotes()
+    if not RemotesFolder then return {} end
+    local found = {}
+    for _, r in RemotesFolder:GetDescendants() do
+        if not (r:IsA("RemoteFunction") or r:IsA("RemoteEvent")) then continue end
+        local l = string.lower(r.Name)
+        if string.find(l, "redeem") or string.find(l, "code") then
+            table.insert(found, r)
+        end
+    end
+    return found
+end
+
+-- ============================================================
+-- ═══════════════════ RAYFIELD UI ═══════════════════════════
+-- ============================================================
+local Window = Rayfield:CreateWindow({
+    Name = "Auto Suite",
+    LoadingTitle = "Auto Suite v3",
+    LoadingSubtitle = "Catch + Ship + Codes",
+    ConfigurationSaving = { Enabled = true, FolderName = "AutoSuite", FileName = "Config" },
+    KeySystem = false,
+})
+
+-- ---------- TAB: AUTO CATCH ----------
+local tabCatch = Window:CreateTab("Auto Catch", 4483362458)
+tabCatch:CreateSection("Aggressive Mode (100% attempt)")
+
+tabCatch:CreateToggle({
+    Name = "Auto Catch (F)",
+    CurrentValue = false,
+    Flag = "CatchToggle",
+    Callback = function(v)
+        if v then
+            if not catchState.running then
+                catchState.running = true
+                task.spawn(catchLoopV2)
+            end
+            Rayfield:Notify({ Title = "AutoCatch", Content = "ON (Aggressive)", Duration = 2 })
+        else
+            catchState.running = false
+            Rayfield:Notify({ Title = "AutoCatch", Content = "OFF", Duration = 2 })
+        end
+    end,
+})
+
+tabCatch:CreateSlider({
+    Name = "Interval (s) — ต่ำ = เร็ว",
+    Range = { 0.02, 1.0 }, Increment = 0.01, Suffix = "s",
+    CurrentValue = catchState.settings.Interval, Flag = "CatchInterval",
+    Callback = function(v) catchState.settings.Interval = v end,
+})
+
+tabCatch:CreateSlider({
+    Name = "Max Angle (°)",
+    Range = { 5, 180 }, Increment = 5, Suffix = "°",
+    CurrentValue = catchState.settings.MaxAngle, Flag = "CatchAngle",
+    Callback = function(v) catchState.settings.MaxAngle = v end,
+})
+
+tabCatch:CreateSlider({
+    Name = "Max Range (studs)",
+    Range = { 20, 1000 }, Increment = 10, Suffix = " studs",
+    CurrentValue = catchState.settings.MaxRange, Flag = "CatchRange",
+    Callback = function(v) catchState.settings.MaxRange = v end,
+})
+
+tabCatch:CreateDropdown({
+    Name = "Preferred Tier",
+    Options = { "auto", "rainbow", "spread", "heavy", "iron" },
+    CurrentOption = { "auto" }, Flag = "CatchTier",
+    Callback = function(o)
+        catchState.settings.PreferTier = (type(o) == "table") and o[1] or o
+    end,
+})
+
+tabCatch:CreateSection("Aggressive Options")
+
+tabCatch:CreateToggle({
+    Name = "Aggressive (retry ทันที)",
+    CurrentValue = true, Flag = "CatchAggressive",
+    Callback = function(v) catchState.settings.Aggressive = v end,
+})
+
+tabCatch:CreateToggle({
+    Name = "Lock Target (ยิงซ้ำตัวเดิม 3 วิ)",
+    CurrentValue = true, Flag = "CatchLock",
+    Callback = function(v) catchState.settings.LockTarget = v end,
+})
+
+tabCatch:CreateToggle({
+    Name = "Rotate Tier (สลับลูกบอล)",
+    CurrentValue = true, Flag = "CatchRotate",
+    Callback = function(v) catchState.settings.RotateTier = v end,
+})
+
+tabCatch:CreateToggle({
+    Name = "Skip Held (ข้ามตัวติด held)",
+    CurrentValue = false, Flag = "CatchSkipHeld",
+    Callback = function(v) catchState.settings.SkipHeld = v end,
+})
+
+tabCatch:CreateToggle({
+    Name = "Auto Enable Catch Mode",
+    CurrentValue = true, Flag = "CatchAutoEnable",
+    Callback = function(v) catchState.settings.AutoEnable = v end,
+})
+
+-- ---------- TAB: SHIP SPEED ----------
+local tabShip = Window:CreateTab("Ship Speed", 4483362458)
+tabShip:CreateSection("การทำงาน")
+
+local shipStatusLabel
+
+local function updateShipStatus()
+    if not shipStatusLabel then return end
+    local ship = shipState.ship or findOwnShip()
+    if not ship then
+        pcall(function()
+            shipStatusLabel:Set({ Title = "Status", Content = "🚫 ไม่พบเรือ (ยังไม่ขึ้นเรือ?)" })
+        end)
+        return
+    end
+    local spd = ship:GetAttribute("ShipSpeed") or 0
+    local st  = ship:GetAttribute("ShipState") or "?"
+    pcall(function()
+        shipStatusLabel:Set({
+            Title = "Status",
+            Content = string.format(
+                "🚢 %s\nState: %s  Speed: %.1f\nMultiplier: x%.2f  Method: %s\nAttributeHook: %s\nFramesBoosted: %d",
+                ship.Name, tostring(st), spd,
+                shipState.multiplier, shipState.method,
+                shipState.hookInstalled and "✅" or "—",
+                stats.speedFrames
+            ),
+        })
+    end)
+end
+
+tabShip:CreateToggle({
+    Name = "Enable Ship Speed",
+    CurrentValue = false, Flag = "ShipToggle",
+    Callback = function(v)
+        shipState.enabled = v
+        if not v then
+            shipState.ship = nil
+            shipState.lastPos = nil
+            shipState.lastTime = 0
+        end
+        Rayfield:Notify({ Title = "ShipSpeed", Content = v and "ON" or "OFF", Duration = 2 })
+    end,
+})
+
+tabShip:CreateSlider({
+    Name = "Speed Multiplier",
+    Range = { 1.5, 10.0 }, Increment = 0.25, Suffix = "x",
+    CurrentValue = shipState.multiplier, Flag = "ShipMult",
+    Callback = function(v) shipState.multiplier = v end,
+})
+
+tabShip:CreateDropdown({
+    Name = "Method",
+    Options = { "AttributeHook", "CFrame", "Hybrid", "Spam" },
+    CurrentOption = { "AttributeHook" }, Flag = "ShipMethod",
+    Callback = function(o)
+        shipState.method = (type(o) == "table") and o[1] or o
+        if shipState.method == "AttributeHook" or shipState.method == "Hybrid" then
+            installAttributeHook()
+        end
+        log("Ship method = " .. shipState.method)
+    end,
+})
+
+tabShip:CreateButton({
+    Name = "🔍 ตรวจ Ship + Remotes + Hook Status",
+    Callback = function()
+        local ship = findOwnShip()
+        local rem  = findShipSpamRemote()
+        local lines = {
+            "Ship: " .. (ship and ship.Name or "ไม่พบ"),
+            "Speed: " .. (ship and tostring(ship:GetAttribute("ShipSpeed")) or "-"),
+            "State: " .. (ship and tostring(ship:GetAttribute("ShipState")) or "-"),
+            "SpamRemote: " .. (rem and rem.Name or "ไม่พบ"),
+            "AttributeHook: " .. (shipState.hookInstalled and "ทำงาน" or "ไม่ทำงาน"),
+        }
+        Rayfield:Notify({
+            Title = "Ship Info",
+            Content = table.concat(lines, "\n"),
+            Duration = 8,
+        })
+    end,
+})
+
+shipStatusLabel = tabShip:CreateParagraph({ Title = "Status", Content = "กำลังสแกน..." })
+
 task.spawn(function()
     while true do
-        task.wait(0.008)
-        if not CFG.Enabled then continue end
-        if pendingDodge then
-            local now = Workspace:GetServerTimeNow()
-            if now > pendingDodge.expires then
-                pendingDodge = nil
-            elseif canDash() then
-                local p = pendingDodge
-                pendingDodge = nil
-                executeDash(p.dir, p.intercept, p.predictive)
-            end
-        end
+        task.wait(0.5)
+        updateShipStatus()
     end
 end)
 
--- ==========================================================
---  LOOPS — RenderStepped + Heartbeat สำรอง
--- ==========================================================
-RunService.RenderStepped:Connect(function()
-    if not CFG.Enabled then return end
-    tryDodgeForCurrentPunch()
-end)
+-- ---------- TAB: CODES ----------
+local tabCodes = Window:CreateTab("Codes", 4483362458)
+tabCodes:CreateSection("Manual Redeem")
 
-RunService.Heartbeat:Connect(function()
-    if not CFG.Enabled then return end
-    tryDodgeForCurrentPunch()
-end)
+local manualCodeBox
+tabCodes:CreateInput({
+    Name = "Code (Manual)",
+    PlaceholderText = "พิมพ์ code แล้วกด Redeem",
+    RemoveTextAfterFocusLost = false, Flag = "CodeInput",
+    Callback = function(t) manualCodeBox = t end,
+})
 
--- ==========================================================
---  MY CHARACTER — NeededDirection instant
--- ==========================================================
-local function bindMyChar(char)
-    for _, c in ipairs(myConns) do c:Disconnect() end
-    table.clear(myConns)
-    if not char then return end
-
-    table.insert(myConns, char:GetAttributeChangedSignal("NeededDirection"):Connect(function()
-        if not CFG.Enabled then return end
-        local nd = getNeededDirection()
-        if not nd then return end
-        if not opponent then return end
-        if CFG.AntiFeint and isOppFeinting(opponent) then return end
-
-        local cpId = opponent:GetAttribute("CurrentPunchId") or 0
-        local state = punchStates[cpId]
-        if state and state.dodged then return end
-
-        local isInt = isInterceptArmed()
-        if tryDash(nd, isInt, cpId) then
-            punchStates[cpId] = punchStates[cpId] or {}
-            punchStates[cpId].dodged = true
-            if isInt then feint.armedUntil = 0 end
-            log("instant ND →", nd, isInt and "(INT)" or "")
+tabCodes:CreateButton({
+    Name = "Redeem Code นี้",
+    Callback = function()
+        if not manualCodeBox or manualCodeBox == "" then
+            Rayfield:Notify({ Title = "Code", Content = "ยังไม่ได้พิมพ์ code", Duration = 3 })
+            return
         end
-    end))
-end
+        local ok, resp = redeemCode(manualCodeBox)
+        Rayfield:Notify({
+            Title = "Code: " .. manualCodeBox,
+            Content = (ok and "✅ " or "❌ ") .. tostring(resp),
+            Duration = 6,
+        })
+    end,
+})
 
--- ==========================================================
---  OPPONENT BINDING
--- ==========================================================
-local function unbindOpp()
-    for _, c in ipairs(oppConns) do c:Disconnect() end
-    table.clear(oppConns)
-    opponent = nil
-end
+tabCodes:CreateSlider({
+    Name = "Cooldown (s)", Range = { 0.5, 5 }, Increment = 0.25, Suffix = "s",
+    CurrentValue = codeState.cooldown, Flag = "CodeCooldown",
+    Callback = function(v) codeState.cooldown = v end,
+})
 
-local function bindOpp(oppChar)
-    unbindOpp()
-    if not oppChar then return end
-    opponent = oppChar
-    log("bound:", oppChar.Name)
+tabCodes:CreateSection("Batch")
 
-    local lastId = oppChar:GetAttribute("CurrentPunchId") or 0
-    table.insert(oppConns, oppChar:GetAttributeChangedSignal("CurrentPunchId"):Connect(function()
-        local nid = oppChar:GetAttribute("CurrentPunchId") or 0
-        if nid ~= lastId then
-            lastId = nid
-            onPunch(oppChar, nil)
+local batchBox
+tabCodes:CreateInput({
+    Name = "Batch List (คั่นด้วย , หรือขึ้นบรรทัดใหม่)",
+    PlaceholderText = "WELCOME,LAUNCH,BETA",
+    RemoveTextAfterFocusLost = false, Flag = "BatchInput",
+    Callback = function(t) batchBox = t end,
+})
+
+local batchProgress
+tabCodes:CreateButton({
+    Name = "▶ Redeem Batch",
+    Callback = function()
+        if not batchBox or batchBox == "" then
+            Rayfield:Notify({ Title = "Code", Content = "ยังไม่มี batch", Duration = 3 })
+            return
         end
-    end))
+        local list = {}
+        for c in string.gmatch(batchBox, "[^,%s]+") do
+            if #c >= 2 then table.insert(list, string.upper(c)) end
+        end
+        if #list == 0 then return end
+        Rayfield:Notify({ Title = "Code", Content = "เริ่ม redeem " .. #list .. " code", Duration = 3 })
+        task.spawn(function()
+            redeemBatch(list, function(i, total, code, ok, resp)
+                if batchProgress then
+                    pcall(function()
+                        batchProgress:Set({
+                            Title = "Progress " .. i .. "/" .. total,
+                            Content = string.format("%s %s\n%s",
+                                ok and "✅" or "❌", code, tostring(resp)),
+                        })
+                    end)
+                end
+            end)
+            Rayfield:Notify({
+                Title = "Code",
+                Content = ("เสร็จ: %d ผ่าน, %d ล้มเหลว")
+                    :format(stats.codesOK, stats.codesTried - stats.codesOK),
+                Duration = 6,
+            })
+        end)
+    end,
+})
 
-    local wp = oppChar:GetAttribute("Punching") or false
-    table.insert(oppConns, oppChar:GetAttributeChangedSignal("Punching"):Connect(function()
-        local n = oppChar:GetAttribute("Punching") or false
-        if n and not wp then onPunch(oppChar, nil) end
-        wp = n
-    end))
+tabCodes:CreateButton({
+    Name = "📋 ใช้ Preset List",
+    Callback = function()
+        batchBox = table.concat(codeState.presets, ",")
+        Rayfield:Notify({
+            Title = "Code",
+            Content = "โหลด " .. #codeState.presets .. " preset (กด Redeem Batch)",
+            Duration = 4,
+        })
+    end,
+})
 
-    local wh = oppChar:GetAttribute("HeavyPunching") or false
-    table.insert(oppConns, oppChar:GetAttributeChangedSignal("HeavyPunching"):Connect(function()
-        local n = oppChar:GetAttribute("HeavyPunching") or false
-        if n and not wh then onPunch(oppChar, true) end
-        wh = n
-    end))
+tabCodes:CreateButton({
+    Name = "🔍 สแกน Code ในแมพ",
+    Callback = function()
+        local found = scanMapCodes()
+        if #found == 0 then
+            Rayfield:Notify({ Title = "Scan", Content = "ไม่พบ code ในแมพ", Duration = 4 })
+            return
+        end
+        batchBox = table.concat(found, ",")
+        Rayfield:Notify({
+            Title = "Scan",
+            Content = "พบ " .. #found .. " code (โหลดเข้า Batch)",
+            Duration = 4,
+        })
+    end,
+})
 
-    local wf = oppChar:GetAttribute("IsFeinting") or false
-    table.insert(oppConns, oppChar:GetAttributeChangedSignal("IsFeinting"):Connect(function()
-        local n = oppChar:GetAttribute("IsFeinting") or false
-        if n and not wf then
-            if CFG.AntiFeint or CFG.FeintIntercept then
-                armFeintIntercept(oppChar)
+batchProgress = tabCodes:CreateParagraph({ Title = "Progress", Content = "-" })
+
+-- ---------- TAB: CODE HUNTER ----------
+local tabHunter = Window:CreateTab("Code Hunter", 4483362458)
+tabHunter:CreateSection("ดึงข้อมูล Redeem")
+
+tabHunter:CreateButton({
+    Name = "🔍 ดึง Redeem Config ทั้งหมด",
+    Callback = function()
+        local cfg, err = inspectRedeemConfig()
+        if not cfg then
+            Rayfield:Notify({ Title = "Config", Content = err or "?", Duration = 6 })
+            return
+        end
+        print("=== Redeem Config Dump ===")
+        dumpConfig(cfg)
+        Rayfield:Notify({
+            Title = "Config",
+            Content = "dump ลง console แล้ว (กด F9)",
+            Duration = 6,
+        })
+    end,
+})
+
+tabHunter:CreateButton({
+    Name = "📡 แสดง Redeem Remotes ทั้งหมด",
+    Callback = function()
+        local list = findRedeemRemotes()
+        if #list == 0 then
+            Rayfield:Notify({ Title = "Remotes", Content = "ไม่พบ redeem remote", Duration = 5 })
+            return
+        end
+        local lines = { "พบ " .. #list .. " remote:" }
+        for _, r in list do
+            table.insert(lines, "  • " .. r:GetFullName() .. " [" .. r.ClassName .. "]")
+        end
+        print(table.concat(lines, "\n"))
+        Rayfield:Notify({ Title = "Remotes", Content = table.concat(lines, "\n"), Duration = 8 })
+    end,
+})
+
+tabHunter:CreateButton({
+    Name = "🪝 Hook Redeem (ดัก response)",
+    Callback = function()
+        local list = findRedeemRemotes()
+        if #list == 0 then
+            Rayfield:Notify({ Title = "Hook", Content = "ไม่พบ redeem remote", Duration = 5 })
+            return
+        end
+        if not hookfunction then
+            Rayfield:Notify({ Title = "Hook", Content = "executor ไม่รองรับ hookfunction", Duration = 5 })
+            return
+        end
+        for _, r in list do
+            if r:IsA("RemoteFunction") then
+                pcall(function()
+                    local old
+                    old = hookfunction(r.InvokeServer, function(self, ...)
+                        local args = { ... }
+                        local ok2, res = pcall(old, self, ...)
+                        print("[Redeem Hook]", r.Name)
+                        print("  args:", args[1])
+                        print("  →", ok2, res)
+                        return res
+                    end)
+                end)
             end
         end
-        wf = n
-    end))
-end
+        Rayfield:Notify({
+            Title = "Hook",
+            Content = "ติดตั้ง hook แล้ว — ลอง redeem ดู console (F9)",
+            Duration = 8,
+        })
+    end,
+})
 
-local function watchOpp()
-    local cd = getMyCD(); if not cd then return end
-    local oppVal = cd:FindFirstChild("Opponent"); if not oppVal then return end
-    bindOpp(oppVal.Value)
-    table.insert(oppConns, oppVal.Changed:Connect(bindOpp))
-end
+-- ---------- TAB: STATUS ----------
+local tabStatus = Window:CreateTab("Status", 4483362458)
+
+local sCatch = tabStatus:CreateParagraph({ Title = "AutoCatch", Content = "-" })
+local sBag   = tabStatus:CreateParagraph({ Title = "Bag", Content = "-" })
+local sShip  = tabStatus:CreateParagraph({ Title = "Ship", Content = "-" })
+local sCodes = tabStatus:CreateParagraph({ Title = "Codes", Content = "-" })
 
 task.spawn(function()
-    while not getMyCD() do task.wait(0.2) end
-    watchOpp()
-    if LP.Character then bindMyChar(LP.Character) end
-end)
-LP.CharacterAdded:Connect(function(c)
-    task.wait(1)
-    watchOpp()
-    bindMyChar(c)
+    while true do
+        task.wait(0.5)
+
+        local cReady, cReason = catchPlayerReady()
+        pcall(function()
+            sCatch:Set({ Title = "AutoCatch", Content = string.format(
+                "%s\n%s\nReason: %s\nThrown:%d Blocked:%d Fail:%d",
+                catchState.running and "🟢 RUNNING" or "🔴 STOPPED",
+                cReady and "✅ Ready" or ("⏸ " .. tostring(cReason)),
+                stats.lastReason, stats.caught, stats.blocked, stats.failed) })
+        end)
+
+        local b = readBag()
+        local bl = {}
+        for _, t in TierOrder do
+            table.insert(bl, string.format("  • %-8s : %d", t, b[t] or 0))
+        end
+        pcall(function() sBag:Set({ Title = "Bag", Content = table.concat(bl, "\n") }) end)
+
+        local sh = shipState.ship
+        pcall(function()
+            sShip:Set({ Title = "Ship", Content = string.format(
+                "%s | Method: %s | x%.2f | Hook: %s",
+                sh and sh.Name or "—", shipState.method,
+                shipState.enabled and shipState.multiplier or 1,
+                shipState.hookInstalled and "✅" or "—") })
+        end)
+
+        pcall(function()
+            sCodes:Set({ Title = "Codes", Content = string.format(
+                "Tried: %d  OK: %d\nRemote: %s",
+                stats.codesTried, stats.codesOK,
+                (codeState.remote and codeState.remote.Name) or "ยังไม่พบ") })
+        end)
+    end
 end)
 
--- ==========================================================
---  GUI — 2 ปุ่มแยก (toggle + gear) ไม่หาย
--- ==========================================================
-local COLORS = {
-    Bg        = Color3.fromRGB(28, 30, 38),
-    On        = Color3.fromRGB(50, 200, 100),
-    Off       = Color3.fromRGB(210, 65, 70),
-    Text      = Color3.fromRGB(240, 240, 245),
-    TextDim   = Color3.fromRGB(150, 155, 170),
-    Slider    = Color3.fromRGB(85, 130, 255),
-    SliderBg  = Color3.fromRGB(50, 55, 70),
-    Panel     = Color3.fromRGB(22, 24, 30),
-    Gear      = Color3.fromRGB(60, 90, 180),
-    GearHi    = Color3.fromRGB(90, 130, 240),
-    Intercept = Color3.fromRGB(200, 130, 50),
-    Perfect   = Color3.fromRGB(255, 215, 80),
-    Predictive= Color3.fromRGB(150, 180, 255),
+-- ============================================================
+-- KEYBIND
+-- ============================================================
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.F then
+        local v = not catchState.running
+        if v then
+            catchState.running = true
+            task.spawn(catchLoopV2)
+        else
+            catchState.running = false
+        end
+        Rayfield:Notify({ Title = "AutoCatch", Content = v and "ON" or "OFF", Duration = 2 })
+    end
+end)
+
+-- ============================================================
+-- EXPORT API
+-- ============================================================
+_G.Suite = {
+    autoCatch = {
+        start  = function() if not catchState.running then catchState.running = true; task.spawn(catchLoopV2) end end,
+        stop   = function() catchState.running = false end,
+        toggle = function()
+            if catchState.running then catchState.running = false
+            else catchState.running = true; task.spawn(catchLoopV2) end
+        end,
+    },
+    ship = {
+        enable  = function(v) shipState.enabled = v ~= false end,
+        setMult = function(x) shipState.multiplier = math.max(1, x) end,
+        method  = function(m) shipState.method = m end,
+        hook    = installAttributeHook,
+    },
+    codes = {
+        redeem  = redeemCode,
+        batch   = redeemBatch,
+        scan    = scanMapCodes,
+        find    = findRedeemRemote,
+        remotes = findRedeemRemotes,
+        config  = inspectRedeemConfig,
+        presets = codeState.presets,
+    },
+    stats = stats,
 }
 
-local old = PGui:FindFirstChild("AutoDodgeUI")
-if old then old:Destroy() end
-
-local gui = Instance.new("ScreenGui")
-gui.Name = "AutoDodgeUI"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.DisplayOrder = 9999
-gui.Parent = PGui
-
--- ============ TOGGLE BUTTON ============
-local TSIZE = 56
-local toggle = Instance.new("TextButton")
-toggle.Name = "MainToggle"
-toggle.Size = UDim2.fromOffset(TSIZE, TSIZE)
-toggle.Position = UDim2.new(1, -TSIZE - 20, 0.5, -TSIZE / 2)
-toggle.BackgroundColor3 = CFG.Enabled and COLORS.On or COLORS.Off
-toggle.Text = CFG.Enabled and "✓" or "✕"
-toggle.TextColor3 = COLORS.Text
-toggle.TextSize = 28
-toggle.Font = Enum.Font.GothamBlack
-toggle.AutoButtonColor = false
-toggle.BorderSizePixel = 0
-toggle.ZIndex = 10
-toggle.Parent = gui
-Instance.new("UICorner", toggle).CornerRadius = UDim.new(1, 0)
-local stroke = Instance.new("UIStroke", toggle)
-stroke.Color = Color3.new(0,0,0); stroke.Thickness = 2; stroke.Transparency = 0.4
-
-local lbl = Instance.new("TextLabel")
-lbl.Size = UDim2.new(1, 60, 0, 14)
-lbl.Position = UDim2.new(0.5, -30, 1, 4)
-lbl.BackgroundTransparency = 1
-lbl.Text = "AUTO DODGE"
-lbl.TextColor3 = COLORS.TextDim
-lbl.TextSize = 10
-lbl.Font = Enum.Font.GothamBold
-lbl.ZIndex = 10
-lbl.Parent = toggle
-
--- ============ GEAR BUTTON ============
-local GSIZE = 34
-local gear = Instance.new("TextButton")
-gear.Name = "GearBtn"
-gear.Size = UDim2.fromOffset(GSIZE, GSIZE)
-gear.Position = UDim2.fromOffset(
-    toggle.Position.X.Offset + (TSIZE - GSIZE) / 2,
-    toggle.Position.Y.Offset + TSIZE + 6
-)
-gear.BackgroundColor3 = COLORS.Gear
-gear.Text = "⚙"
-gear.TextColor3 = COLORS.Text
-gear.TextSize = 18
-gear.Font = Enum.Font.GothamBold
-gear.AutoButtonColor = false
-gear.BorderSizePixel = 0
-gear.ZIndex = 10
-gear.Parent = gui
-Instance.new("UICorner", gear).CornerRadius = UDim.new(1, 0)
-local gs = Instance.new("UIStroke", gear)
-gs.Color = Color3.new(0,0,0); gs.Thickness = 1.5; gs.Transparency = 0.4
-
--- ============ SETTINGS PANEL ============
-local panel = Instance.new("Frame")
-panel.Name = "SettingsPanel"
-panel.Size = UDim2.fromOffset(240, 460)
-panel.Position = UDim2.fromOffset(
-    toggle.Position.X.Offset - 250,
-    toggle.Position.Y.Offset - 230
-)
-panel.BackgroundColor3 = COLORS.Panel
-panel.BorderSizePixel = 0
-panel.Visible = false
-panel.ZIndex = 9
-panel.Parent = gui
-Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
-local ps = Instance.new("UIStroke", panel)
-ps.Color = Color3.fromRGB(60, 65, 85); ps.Thickness = 1
-
-local function mkLabel(parent, text, y, color, size)
-    local l = Instance.new("TextLabel")
-    l.Size = UDim2.new(1, -20, 0, 18)
-    l.Position = UDim2.fromOffset(10, y)
-    l.BackgroundTransparency = 1
-    l.Text = text
-    l.TextColor3 = color or COLORS.Text
-    l.TextSize = size or 13
-    l.Font = Enum.Font.GothamSemibold
-    l.TextXAlignment = Enum.TextXAlignment.Left
-    l.ZIndex = 10
-    l.Parent = parent
-    return l
-end
-
-local function mkToggle(parent, text, y, key)
-    mkLabel(parent, text, y)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.fromOffset(70, 22)
-    btn.Position = UDim2.new(1, -80, 0, y)
-    btn.BackgroundColor3 = CFG[key] and COLORS.On or COLORS.Off
-    btn.Text = CFG[key] and "ON" or "OFF"
-    btn.TextColor3 = COLORS.Text
-    btn.TextSize = 12
-    btn.Font = Enum.Font.GothamBold
-    btn.AutoButtonColor = false
-    btn.BorderSizePixel = 0
-    btn.ZIndex = 10
-    btn.Parent = parent
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
-    btn.MouseButton1Click:Connect(function()
-        CFG[key] = not CFG[key]
-        btn.Text = CFG[key] and "ON" or "OFF"
-        btn.BackgroundColor3 = CFG[key] and COLORS.On or COLORS.Off
-    end)
-    return btn
-end
-
-local function mkSlider(parent, text, y, min, max, initial, cb)
-    mkLabel(parent, text, y)
-    local val = Instance.new("TextLabel")
-    val.Size = UDim2.fromOffset(80, 18)
-    val.Position = UDim2.new(1, -90, 0, y)
-    val.BackgroundTransparency = 1
-    val.Text = string.format("%.2f", initial)
-    val.TextColor3 = COLORS.Text
-    val.TextSize = 12
-    val.Font = Enum.Font.GothamBold
-    val.TextXAlignment = Enum.TextXAlignment.Right
-    val.ZIndex = 10
-    val.Parent = parent
-
-    local bar = Instance.new("Frame")
-    bar.Size = UDim2.new(1, -20, 0, 6)
-    bar.Position = UDim2.fromOffset(10, y + 20)
-    bar.BackgroundColor3 = COLORS.SliderBg
-    bar.BorderSizePixel = 0
-    bar.ZIndex = 10
-    bar.Parent = parent
-    Instance.new("UICorner", bar).CornerRadius = UDim.new(1, 0)
-
-    local fill = Instance.new("Frame")
-    fill.Size = UDim2.fromScale((initial - min) / (max - min), 1)
-    fill.BackgroundColor3 = COLORS.Slider
-    fill.BorderSizePixel = 0
-    fill.ZIndex = 10
-    fill.Parent = bar
-    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
-
-    local knob = Instance.new("Frame")
-    knob.Size = UDim2.fromOffset(14, 14)
-    knob.AnchorPoint = Vector2.new(0.5, 0.5)
-    knob.Position = UDim2.new(fill.Size.X.Scale, 0, 0.5, 0)
-    knob.BackgroundColor3 = Color3.new(1,1,1)
-    knob.BorderSizePixel = 0
-    knob.ZIndex = 11
-    knob.Parent = bar
-    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
-
-    local dragging = false
-    local function setX(x)
-        local ax = bar.AbsolutePosition.X
-        local w  = bar.AbsoluteSize.X
-        if w <= 0 then return end
-        local p = math.clamp((x - ax) / w, 0, 1)
-        local v = min + (max - min) * p
-        fill.Size = UDim2.fromScale(p, 1)
-        knob.Position = UDim2.new(p, 0, 0.5, 0)
-        val.Text = string.format("%.2f", v)
-        cb(v)
-    end
-    bar.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1
-            or i.UserInputType == Enum.UserInputType.Touch then
-            dragging = true; setX(i.Position.X)
-        end
-    end)
-    UIS.InputChanged:Connect(function(i)
-        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
-            or i.UserInputType == Enum.UserInputType.Touch) then
-            setX(i.Position.X)
-        end
-    end)
-    UIS.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1
-            or i.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
-    end)
-    return val
-end
-
-mkLabel(panel, "⚙ Auto Dodge Settings", 8, COLORS.Text, 14)
-mkToggle(panel, "Enabled",          32,  "Enabled")
-mkToggle(panel, "Anti-Feint",       66,  "AntiFeint")
-mkToggle(panel, "Feint Intercept",  100, "FeintIntercept")
-mkSlider(panel, "Margin (s)",       140, 0.02, 0.25, CFG.Margin,         function(v) CFG.Margin = v end)
-mkSlider(panel, "Cooldown (s)",     186, 0.005, 0.30, CFG.MinCooldown,   function(v) CFG.MinCooldown = v end)
-mkSlider(panel, "Arm Window (s)",   232, 0.3,  1.5,  CFG.FeintArmWindow,  function(v) CFG.FeintArmWindow = v end)
-mkToggle(panel, "Debug Log",        278, "Debug")
-
-mkLabel(panel, "─ Stats ─", 320, COLORS.TextDim, 11)
-local sDodge = mkLabel(panel, "Dodges: 0",     342)
-local sPerf  = mkLabel(panel, "Perfect: 0",    362, COLORS.Perfect)
-local sInt   = mkLabel(panel, "Intercepts: 0", 382, COLORS.Intercept)
-local sPred  = mkLabel(panel, "Predictive: 0", 402, COLORS.Predictive)
-local sState = mkLabel(panel, "State: -",      422, COLORS.TextDim, 11)
-
-RunService.Heartbeat:Connect(function()
-    if not panel.Visible then return end
-    sDodge.Text = "Dodges: " .. stats.dodges
-    sPerf.Text  = "Perfect: " .. stats.perfects
-    sInt.Text   = "Intercepts: " .. stats.intercepts
-    sPred.Text  = "Predictive: " .. stats.predictives
-    local now = Workspace:GetServerTimeNow()
-    if now < feint.armedUntil then
-        sState.Text = string.format("🎯 ARMED %.2fs", feint.armedUntil - now)
-        sState.TextColor3 = COLORS.Intercept
-    elseif pendingDodge then
-        sState.Text = string.format("Queued %.2fs", math.max(0, pendingDodge.expires - now))
-        sState.TextColor3 = Color3.fromRGB(255, 180, 80)
-    else
-        sState.Text = "State: ready"
-        sState.TextColor3 = COLORS.TextDim
-    end
-end)
-
--- ============ INTERACTIONS ============
-local function refreshToggle()
-    toggle.BackgroundColor3 = CFG.Enabled and COLORS.On or COLORS.Off
-    toggle.Text = CFG.Enabled and "✓" or "✕"
-    TS:Create(toggle, TweenInfo.new(0.15, Enum.EasingStyle.Back),
-        { Size = UDim2.fromOffset(TSIZE, TSIZE) }):Play()
-end
-
-local function setEnabled(v)
-    CFG.Enabled = v and true or false
-    if not CFG.Enabled then pendingDodge = nil end
-    refreshToggle()
-    print("[AutoDodge]", CFG.Enabled and "✅ ON" or "❌ OFF")
-end
-
-toggle.MouseButton1Click:Connect(function()
-    setEnabled(not CFG.Enabled)
-end)
-
-gear.MouseButton1Click:Connect(function()
-    panel.Visible = not panel.Visible
-    gear.BackgroundColor3 = panel.Visible and COLORS.GearHi or COLORS.Gear
-end)
-
--- drag both toggle + gear
-local drag = { active = false, moved = false, start = Vector2.zero, pos0 = nil }
-toggle.InputBegan:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.MouseButton1
-        or i.UserInputType == Enum.UserInputType.Touch then
-        drag.active = true
-        drag.moved = false
-        drag.start = Vector2.new(i.Position.X, i.Position.Y)
-        drag.pos0 = toggle.Position
-    end
-end)
-UIS.InputChanged:Connect(function(i)
-    if drag.active and (i.UserInputType == Enum.UserInputType.MouseMovement
-        or i.UserInputType == Enum.UserInputType.Touch) then
-        local cur = Vector2.new(i.Position.X, i.Position.Y)
-        local d = cur - drag.start
-        if d.Magnitude > 6 then
-            drag.moved = true
-            toggle.Position = UDim2.fromOffset(drag.pos0.X.Offset + d.X, drag.pos0.Y.Offset + d.Y)
-            gear.Position = UDim2.fromOffset(
-                toggle.Position.X.Offset + (TSIZE - GSIZE) / 2,
-                toggle.Position.Y.Offset + TSIZE + 6
-            )
-            panel.Position = UDim2.fromOffset(
-                toggle.Position.X.Offset - 250,
-                toggle.Position.Y.Offset - 230
-            )
-        end
-    end
-end)
-UIS.InputEnded:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.MouseButton1
-        or i.UserInputType == Enum.UserInputType.Touch then
-        drag.active = false
-    end
-end)
-
--- ==========================================================
---  PUBLIC API
--- ==========================================================
-_G.AutoDodge = {
-    Toggle            = function() setEnabled(not CFG.Enabled); return CFG.Enabled end,
-    Enable            = function() setEnabled(true)  end,
-    Disable           = function() setEnabled(false) end,
-    SetMargin         = function(m) CFG.Margin = m end,
-    SetCooldown       = function(c) CFG.MinCooldown = c end,
-    SetPingOffset     = function(o) CFG.ManualPingOffset = o end,
-    SetAntiFeint      = function(v) CFG.AntiFeint = v end,
-    SetFeintIntercept = function(v) CFG.FeintIntercept = v end,
-    SetArmWindow      = function(w) CFG.FeintArmWindow = w end,
-    Debug             = function(v) CFG.Debug = v end,
-    Config            = CFG,
-    Stats             = stats,
-    Feint             = feint,
-    GUI               = gui,
-}
-
-print("[AutoDodge V6] ✅ Loaded")
-print("  • คลิกปุ่มวงกลม = toggle ON/OFF")
-print("  • คลิกเฟือง = เปิด settings")
-print("  • ลาก = ย้ายตำแหน่ง")
-print("  • Close-range fixed: Margin 0.12 + DASH_WINDOW 0.22")
+log("โหลดเสร็จ — Rayfield UI พร้อมใช้งาน")
+Rayfield:Notify({
+    Title = "Auto Suite",
+    Content = "พร้อมใช้งาน (F = AutoCatch) — Aggressive mode เปิดอยู่",
+    Duration = 5,
+})
