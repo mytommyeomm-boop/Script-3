@@ -1,5 +1,5 @@
 --[[ ============================================================
-    AUTO FARM V6 (Fixed Prompts + Walk to Exact Target + Minimize UI)
+    AUTO FARM V7 (Non-Blocking Walk + Accurate Distance)
 ============================================================ ]]
 
 local Players           = game:GetService("Players")
@@ -64,21 +64,6 @@ local function freeHands()
     end
 end
 
-local function walkTo(pos, timeout)
-    local char, root, hum = getChar()
-    if not root or not hum then return false end
-    timeout = timeout or 10
-    local t0 = tick()
-    while tick() - t0 < timeout do
-        if not root.Parent then return false end
-        if (root.Position - pos).Magnitude <= 6 then return true end
-        pcall(function() hum:MoveTo(pos) end)
-        task.wait(0.1)
-    end
-    return false
-end
-
--- จำลองการกด ProximityPrompt
 local function holdPrompt(prompt)
     if not prompt or not prompt.Enabled then return false end
     pcall(function()
@@ -152,9 +137,9 @@ local function findHarvestProximity()
     for _, fruit in ipairs(CollectionService:GetTagged("DurianFruit")) do
         local ok, prompt, part = canHarvest(fruit)
         if ok then
-            -- วัดระยะจาก Prompt โดยตรง (เพราะบางที Part กับ Prompt อยู่คนละที่)
             local pos = prompt.Parent:IsA("BasePart") and prompt.Parent.Position or part.Position
-            local d = (pos - root.Position).Magnitude
+            -- ใช้ระยะ 2D ในการหาเป้าหมาย (ไม่สนความสูง)
+            local d = (Vector3.new(pos.X, root.Position.Y, pos.Z) - root.Position).Magnitude
             if d < bestD then
                 best = { fruit=fruit, prompt=prompt, part=part, pos=pos, dist=d }
                 bestD = d
@@ -165,26 +150,31 @@ local function findHarvestProximity()
 end
 
 local function tryHarvest()
-    local char, root = getChar()
-    if not char or not root then Status.Harvest = "NO CHAR" return false end
+    local char, root, hum = getChar()
+    if not char or not root or not hum then Status.Harvest = "NO CHAR" return false end
     if char:GetAttribute("CatchStart") then Status.Harvest = "CATCHING..." return true end
 
     Status.Harvest = "SEARCHING"
     local target = findHarvestProximity()
-    if not target then Status.Harvest = "NO TARGET" return false end
-
-    -- ถ้าระยะไกลกว่า 8 studs ให้เดินเข้าไปใกล้ๆ
-    if target.dist > 8 then
-        Status.Harvest = "WALKING TO FRUIT"
-        walkTo(target.pos)
-        return true
+    if not target then 
+        hum:MoveTo(root.Position) -- สั่งหยุดเดิน
+        Status.Harvest = "NO TARGET" 
+        return false 
     end
 
+    -- ถ้าระยะ 2D ไกลกว่า 10 ฟุต ให้เดินเข้าไปหา (ใช้ MoveTo แบบไม่บล็อค)
+    if target.dist > 10 then
+        Status.Harvest = "WALKING TO FRUIT"
+        local movePos = Vector3.new(target.pos.X, root.Position.Y, target.pos.Z)
+        hum:MoveTo(movePos)
+        return true -- รอ Tick ถัดไป
+    end
+
+    hum:MoveTo(root.Position) -- สั่งหยุดเดินเมื่อใกล้พอ
     freeHands() 
     showRay(root.Position + Vector3.new(0, 2, 0), target.pos, Color3.fromRGB(0, 255, 140))
     Status.Harvest = "HARVESTING"
 
-    -- ใช้ Remote ยิง Prompt
     local ok = pcall(function() HarvestRemote:FireServer(target.prompt) end)
     if not ok then return false end
 
@@ -216,7 +206,7 @@ local function tryHarvest()
 end
 
 -- ============================================================
--- WATER (รดน้ำ & เติมน้ำ ด้วย Prompt)
+-- WATER
 -- ============================================================
 local function findWateringCan()
     local char = LP.Character
@@ -242,7 +232,6 @@ end
 local function findWellPrompt()
     local base = getMyBase()
     if not base then return end
-    -- หา Prompt ที่ชื่อว่า Fill Water หรืออยู่ในบ่อ
     for _, d in ipairs(base:GetDescendants()) do
         if d:IsA("ProximityPrompt") and (d.ActionText:lower():find("fill") or d.ObjectText:lower():find("well")) then
             if d.Enabled and d.Parent and d.Parent:IsA("BasePart") then
@@ -277,61 +266,72 @@ local function findWaterTarget()
 end
 
 local function tryWater()
-    local char, root = getChar()
-    if not char or not root then Status.Water = "NO CHAR" return false end
+    local char, root, hum = getChar()
+    if not char or not root or not hum then Status.Water = "NO CHAR" return false end
 
     local can = findWateringCan()
     if not can then Status.Water = "NO CAN" return false end
 
-    -- ถือบัวรดน้ำ
     local curTool = char:FindFirstChildOfClass("Tool")
     if curTool ~= can then
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then pcall(function() hum:EquipTool(can) end) task.wait(0.2) end
+        pcall(function() hum:EquipTool(can) end) 
+        task.wait(0.1)
     end
 
     local uses = LP:GetAttribute("WaterUses") or 0
-    if uses <= 0 then
+    
+    -- ถ้ามีน้ำ ให้ไปรดต้นไม้
+    if uses > 0 then
+        local target, dist = findWaterTarget()
+        if not target then 
+            hum:MoveTo(root.Position)
+            Status.Water = "ALL DONE" 
+            return false 
+        end
+
+        if dist > 10 then
+            Status.Water = "WALKING TO PLANT"
+            hum:MoveTo(Vector3.new(target.Position.X, root.Position.Y, target.Position.Z))
+            return true
+        end
+
+        hum:MoveTo(root.Position) -- หยุดเดิน
+        local usesBefore = LP:GetAttribute("WaterUses") or 0
+        WaterRemote:FireServer("Water", target.Position)
+        showRay(root.Position + Vector3.new(0, 2, 0), target.Position, Color3.fromRGB(90, 190, 255))
+        task.wait(0.8)
+        local usesAfter = LP:GetAttribute("WaterUses") or 0
+
+        wateredSet[target] = true
+        if usesAfter < usesBefore then
+            Stats.Watered = Stats.Watered + 1
+            Status.Water = "WATERED ✓"
+        else
+            Status.Water = "ALREADY WET"
+        end
+        return true
+    else
+        -- ถ้าน้ำหมด ให้ไปเติมน้ำที่บ่อ
         local wellPrompt, wellPos = findWellPrompt()
-        if not wellPrompt or not wellPos then Status.Water = "NO WELL FOUND" return false end
+        if not wellPrompt or not wellPos then 
+            hum:MoveTo(root.Position)
+            Status.Water = "NO WELL FOUND" 
+            return false 
+        end
         
-        if (root.Position - wellPos).Magnitude > 10 then
+        local dist = (Vector3.new(wellPos.X, root.Position.Y, wellPos.Z) - root.Position).Magnitude
+        if dist > 10 then
             Status.Water = "WALKING TO WELL"
-            walkTo(wellPos)
+            hum:MoveTo(Vector3.new(wellPos.X, root.Position.Y, wellPos.Z))
             return true
         end
         
-        -- กดปุ่ม Fill Water (ProximityPrompt)
-        Status.Water = "REFILLING (Prompt)"
+        hum:MoveTo(root.Position) -- หยุดเดิน
+        Status.Water = "REFILLING"
         holdPrompt(wellPrompt)
         task.wait(1.5)
         return true
     end
-
-    local target, dist = findWaterTarget()
-    if not target then Status.Water = "ALL DONE" return false end
-
-    if dist > 10 then
-        Status.Water = "WALKING TO PLANT"
-        walkTo(target.Position)
-        return true
-    end
-
-    -- รดน้ำต้นไม้ (ใช้ Remote)
-    local usesBefore = LP:GetAttribute("WaterUses") or 0
-    WaterRemote:FireServer("Water", target.Position)
-    showRay(root.Position + Vector3.new(0, 2, 0), target.Position, Color3.fromRGB(90, 190, 255))
-    task.wait(0.8)
-    local usesAfter = LP:GetAttribute("WaterUses") or 0
-
-    wateredSet[target] = true
-    if usesAfter < usesBefore then
-        Stats.Watered = Stats.Watered + 1
-        Status.Water = "WATERED ✓"
-    else
-        Status.Water = "ALREADY WET"
-    end
-    return true
 end
 
 -- ============================================================
@@ -383,11 +383,15 @@ local function findBuyer(kind)
 end
 
 local function trySell()
-    local char, root = getChar()
-    if not char or not root then Status.Sell = "NO CHAR" return false end
+    local char, root, hum = getChar()
+    if not char or not root or not hum then Status.Sell = "NO CHAR" return false end
 
     local inv = inventoryCount()
-    if (inv.durian + inv.lump + inv.palm) == 0 then Status.Sell = "NOTHING" return false end
+    if (inv.durian + inv.lump + inv.palm) == 0 then 
+        hum:MoveTo(root.Position)
+        Status.Sell = "NOTHING" 
+        return false 
+    end
     if not SellRemote then Status.Sell = "NO REMOTE" return false end
 
     local targetKind = nil
@@ -396,14 +400,19 @@ local function trySell()
     elseif inv.palm > 0 then targetKind = "Palm" end
     
     local buyer = findBuyer(targetKind)
-    if not buyer then Status.Sell = "NO "..targetKind.." BUYER" return false end
+    if not buyer then 
+        hum:MoveTo(root.Position)
+        Status.Sell = "NO "..targetKind.." BUYER" 
+        return false 
+    end
 
     if buyer.dist > 15 then
         Status.Sell = "WALKING TO "..targetKind
-        walkTo(buyer.part.Position)
+        hum:MoveTo(Vector3.new(buyer.part.Position.X, root.Position.Y, buyer.part.Position.Z))
         return true
     end
 
+    hum:MoveTo(root.Position) -- หยุดเดิน
     local mode
     if targetKind == "Durian" then mode = "All"
     elseif targetKind == "Rubber" then mode = "LumpAll"
@@ -489,7 +498,7 @@ mk(titleBar, "TextLabel", {
     Size = UDim2.new(1, -60, 1, 0),
     Position = UDim2.fromOffset(12, 0),
     BackgroundTransparency = 1,
-    Text = "🌾 Auto Farm V6",
+    Text = "🌾 Auto Farm V7",
     TextColor3 = Color3.fromRGB(0, 230, 150),
     TextSize = 15,
     Font = Enum.Font.GothamBold,
@@ -803,4 +812,4 @@ UserInputService.InputBegan:Connect(function(input, gp)
     end
 end)
 
-print("[AutoFarm V6] โหลดเสร็จ — ระบบกด Prompt ถูกต้องแล้ว")
+print("[AutoFarm V7] โหลดเสร็จ — ระบบเดินแบบ Non-Blocking ทำงานได้ 100%")
