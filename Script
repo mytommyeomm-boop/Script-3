@@ -1,5 +1,5 @@
 --[[ ============================================================
-    AUTO FARM V5 (Fixed Water + Fixed Harvest + Mobile Support + Minimize UI)
+    AUTO FARM V6 (Fixed Prompts + Walk to Exact Target + Minimize UI)
 ============================================================ ]]
 
 local Players           = game:GetService("Players")
@@ -19,7 +19,6 @@ local WaterRemote   = Remotes:WaitForChild("Water", 15)
 local SellRemote    = Remotes:WaitForChild("SellDurians", 15)
 local CatchCancel   = Remotes:FindFirstChild("CatchCancel")
 
--- โหลด Config ทุเรียนเพื่อแยกประเภท (ทุเรียน/ปาล์ม)
 local DurianConfig
 pcall(function()
     DurianConfig = require(ReplicatedStorage.Shared:WaitForChild("DurianConfig"))
@@ -32,12 +31,9 @@ local Config = {
     Harvest     = false,
     Water       = false,
     Sell        = false,
-
     HarvestRange = 35,
     WaterRange   = 50,     
     SellRange    = 250,    
-
-    HarvestMode  = "Proximity",
     AutoPurge    = false,
     Noclip       = true,
     Cooldown     = 0.4,
@@ -82,6 +78,18 @@ local function walkTo(pos, timeout)
     return false
 end
 
+-- จำลองการกด ProximityPrompt
+local function holdPrompt(prompt)
+    if not prompt or not prompt.Enabled then return false end
+    pcall(function()
+        prompt:InputHoldBegin()
+        task.wait(prompt.HoldDuration + 0.1)
+        prompt:InputHoldEnd()
+    end)
+    task.wait(0.2)
+    return true
+end
+
 local function showRay(from, to, color)
     if not Config.ShowRay then return end
     local dir = to - from
@@ -116,7 +124,7 @@ RunService.Stepped:Connect(function()
 end)
 
 -- ============================================================
--- HARVEST (แก้ไขให้เดินใกล้ก่อนเก็บ)
+-- HARVEST
 -- ============================================================
 local function findPrompt(fruit)
     for _, d in ipairs(fruit:GetDescendants()) do
@@ -144,81 +152,16 @@ local function findHarvestProximity()
     for _, fruit in ipairs(CollectionService:GetTagged("DurianFruit")) do
         local ok, prompt, part = canHarvest(fruit)
         if ok then
-            local d = (part.Position - root.Position).Magnitude
+            -- วัดระยะจาก Prompt โดยตรง (เพราะบางที Part กับ Prompt อยู่คนละที่)
+            local pos = prompt.Parent:IsA("BasePart") and prompt.Parent.Position or part.Position
+            local d = (pos - root.Position).Magnitude
             if d < bestD then
-                best = { fruit=fruit, prompt=prompt, part=part, dist=d }
+                best = { fruit=fruit, prompt=prompt, part=part, pos=pos, dist=d }
                 bestD = d
             end
         end
     end
     return best
-end
-
-local function findHarvestAim()
-    local cam = workspace.CurrentCamera
-    if not cam then return end
-    local vp = cam.ViewportSize
-    local ray = cam:ViewportPointToRay(vp.X * 0.5, vp.Y * 0.5)
-
-    local parts = {}
-    for _, fruit in ipairs(CollectionService:GetTagged("DurianFruit")) do
-        if canHarvest(fruit) then
-            local p = fruit:FindFirstChildWhichIsA("BasePart", true)
-            if p then table.insert(parts, p) end
-        end
-    end
-    if #parts == 0 then return end
-
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Include
-    params.FilterDescendantsInstances = parts
-    local res = workspace:Raycast(ray.Origin, ray.Direction * 250, params)
-    if not res then return end
-
-    local inst = res.Instance
-    while inst and inst ~= workspace do
-        if CollectionService:HasTag(inst, "DurianFruit") then
-            local ok, prompt, part = canHarvest(inst)
-            if ok then
-                return { fruit=inst, prompt=prompt, part=part, dist=res.Distance }
-            end
-        end
-        inst = inst.Parent
-    end
-end
-
-local function fireHarvest(target)
-    local char = getChar()
-    if not char then return false end
-    
-    -- วางของในมือก่อนเสมอ
-    freeHands() 
-    
-    -- ยิง Prompt
-    local ok = pcall(function() HarvestRemote:FireServer(target.prompt) end)
-    if not ok then return false end
-
-    -- รอให้เซิร์ฟเวอร์ตอบกลับ (CatchStart)
-    local t0 = tick()
-    local started = false
-    while tick() - t0 < 3 do
-        if char:GetAttribute("CatchStart") then started = true break end
-        if not char.Parent then return false end
-        task.wait(0.05)
-    end
-    if not started then return false end
-
-    -- รอจนกว่าจะจับเสร็จ
-    t0 = tick()
-    while char.Parent and char:GetAttribute("CatchStart") and (tick() - t0) < 10 do
-        task.wait(0.1)
-    end
-    if not char.Parent then return false end
-    if char:GetAttribute("CatchStart") then
-        if CatchCancel then pcall(function() CatchCancel:FireServer() end) end
-        return false
-    end
-    return true
 end
 
 local function tryHarvest()
@@ -227,20 +170,43 @@ local function tryHarvest()
     if char:GetAttribute("CatchStart") then Status.Harvest = "CATCHING..." return true end
 
     Status.Harvest = "SEARCHING"
-    local target = Config.HarvestMode == "Aim" and findHarvestAim() or findHarvestProximity()
+    local target = findHarvestProximity()
     if not target then Status.Harvest = "NO TARGET" return false end
 
-    -- ถ้าระยะไกลเกิน 10 ให้เดินเข้าไปใกล้ก่อน
-    if target.dist > 10 then
+    -- ถ้าระยะไกลกว่า 8 studs ให้เดินเข้าไปใกล้ๆ
+    if target.dist > 8 then
         Status.Harvest = "WALKING TO FRUIT"
-        walkTo(target.part.Position)
+        walkTo(target.pos)
         return true
     end
 
-    showRay(root.Position + Vector3.new(0, 2, 0), target.part.Position, Color3.fromRGB(0, 255, 140))
+    freeHands() 
+    showRay(root.Position + Vector3.new(0, 2, 0), target.pos, Color3.fromRGB(0, 255, 140))
     Status.Harvest = "HARVESTING"
-    local ok = fireHarvest(target)
-    if ok then
+
+    -- ใช้ Remote ยิง Prompt
+    local ok = pcall(function() HarvestRemote:FireServer(target.prompt) end)
+    if not ok then return false end
+
+    local t0 = tick()
+    local started = false
+    while tick() - t0 < 3 do
+        if char:GetAttribute("CatchStart") then started = true break end
+        if not char.Parent then return false end
+        task.wait(0.05)
+    end
+    if not started then 
+        Status.Harvest = "FAILED (Too far?)"
+        return false 
+    end
+
+    t0 = tick()
+    while char.Parent and char:GetAttribute("CatchStart") and (tick() - t0) < 10 do
+        task.wait(0.1)
+    end
+    
+    if char:GetAttribute("CatchStart") then
+        if CatchCancel then pcall(function() CatchCancel:FireServer() end) end
         Stats.Harvested = Stats.Harvested + 1
         Status.Harvest = "DONE ✓"
     else
@@ -250,7 +216,7 @@ local function tryHarvest()
 end
 
 -- ============================================================
--- WATER (แก้ไขระบบรดน้ำ)
+-- WATER (รดน้ำ & เติมน้ำ ด้วย Prompt)
 -- ============================================================
 local function findWateringCan()
     local char = LP.Character
@@ -273,17 +239,14 @@ local function getMyBase()
     end
 end
 
-local function findWell()
+local function findWellPrompt()
     local base = getMyBase()
     if not base then return end
-    -- ค้นหาบ่อน้ำจากชื่อที่หลากหลายขึ้น
+    -- หา Prompt ที่ชื่อว่า Fill Water หรืออยู่ในบ่อ
     for _, d in ipairs(base:GetDescendants()) do
-        if d:IsA("BasePart") then
-            local name = d.Name:lower()
-            if name:find("well") or name:find("water") or name:find("barrel") then
-                if d.Size.Y < 25 then -- กันหลังคาหรือกำแพง
-                    return d.Position
-                end
+        if d:IsA("ProximityPrompt") and (d.ActionText:lower():find("fill") or d.ObjectText:lower():find("well")) then
+            if d.Enabled and d.Parent and d.Parent:IsA("BasePart") then
+                return d, d.Parent.Position
             end
         end
     end
@@ -297,10 +260,8 @@ local function findWaterTarget()
 
     local best, bestD = nil, Config.WaterRange
     for _, slot in ipairs(base:GetDescendants()) do
-        -- ในเกม PlantSpot มักจะซ่อนอยู่ใน Model (Slot) ไม่ใช่ BasePart ตรงๆ
         if slot:IsA("Model") then
             local plantSpot = slot:FindFirstChild("PlantSpot")
-            -- ต้องมั่นใจว่าเป็น BasePart และมีต้นไม้หรือเมล็ดพันธุ์อยู่
             if plantSpot and plantSpot:IsA("BasePart") and not wateredSet[plantSpot] then
                 if slot:FindFirstChild("Tree") or slot:FindFirstChild("Seed") then
                     local dist = (plantSpot.Position - root.Position).Magnitude
@@ -329,11 +290,10 @@ local function tryWater()
         if hum then pcall(function() hum:EquipTool(can) end) task.wait(0.2) end
     end
 
-    -- เช็คน้ำในตัวละคร (ถ้ามีน้ำอยู่แล้ว ข้ามไปรดเลย)
     local uses = LP:GetAttribute("WaterUses") or 0
     if uses <= 0 then
-        local wellPos = findWell()
-        if not wellPos then Status.Water = "NO WELL FOUND" return false end
+        local wellPrompt, wellPos = findWellPrompt()
+        if not wellPrompt or not wellPos then Status.Water = "NO WELL FOUND" return false end
         
         if (root.Position - wellPos).Magnitude > 10 then
             Status.Water = "WALKING TO WELL"
@@ -341,14 +301,13 @@ local function tryWater()
             return true
         end
         
-        -- ยิงรีโมทเพื่อเติมน้ำ (ยิงที่ตำแหน่งตัวเอง)
-        WaterRemote:FireServer("Water", char:GetPivot().Position)
-        Status.Water = "REFILLING"
-        task.wait(1.2)
+        -- กดปุ่ม Fill Water (ProximityPrompt)
+        Status.Water = "REFILLING (Prompt)"
+        holdPrompt(wellPrompt)
+        task.wait(1.5)
         return true
     end
 
-    -- หาต้นไม้ที่ต้องรด
     local target, dist = findWaterTarget()
     if not target then Status.Water = "ALL DONE" return false end
 
@@ -358,6 +317,7 @@ local function tryWater()
         return true
     end
 
+    -- รดน้ำต้นไม้ (ใช้ Remote)
     local usesBefore = LP:GetAttribute("WaterUses") or 0
     WaterRemote:FireServer("Water", target.Position)
     showRay(root.Position + Vector3.new(0, 2, 0), target.Position, Color3.fromRGB(90, 190, 255))
@@ -478,7 +438,6 @@ task.spawn(function()
     end
 end)
 
--- รีเซ็ตรายการที่รดน้ำแล้วทุกๆ 1 นาที (เพื่อไม่ให้ค้างนานเกินไป)
 task.spawn(function()
     while true do
         task.wait(60)
@@ -487,7 +446,7 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- UI & MINIMIZE SYSTEM
+-- UI
 -- ============================================================
 local function mk(parent, class, props)
     local o = Instance.new(class)
@@ -530,7 +489,7 @@ mk(titleBar, "TextLabel", {
     Size = UDim2.new(1, -60, 1, 0),
     Position = UDim2.fromOffset(12, 0),
     BackgroundTransparency = 1,
-    Text = "🌾 Auto Farm V5 (Fix)",
+    Text = "🌾 Auto Farm V6",
     TextColor3 = Color3.fromRGB(0, 230, 150),
     TextSize = 15,
     Font = Enum.Font.GothamBold,
@@ -699,26 +658,9 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
-local modeBtn = mk(cfgBox, "TextButton", {
-    Size = UDim2.new(0, 140, 0, 26),
-    Position = UDim2.fromOffset(8, 44),
-    BackgroundColor3 = Color3.fromRGB(50, 55, 65),
-    Text = "Harvest: " .. Config.HarvestMode,
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 12,
-    Font = Enum.Font.Gotham,
-    AutoButtonColor = false,
-    BorderSizePixel = 0,
-})
-corner(modeBtn, 5)
-modeBtn.MouseButton1Click:Connect(function()
-    Config.HarvestMode = Config.HarvestMode == "Proximity" and "Aim" or "Proximity"
-    modeBtn.Text = "Harvest: " .. Config.HarvestMode
-end)
-
 local noclipBtn = mk(cfgBox, "TextButton", {
     Size = UDim2.new(0, 140, 0, 26),
-    Position = UDim2.fromOffset(156, 44),
+    Position = UDim2.fromOffset(8, 44),
     BackgroundColor3 = Color3.fromRGB(50, 60, 55),
     Text = "Noclip: " .. (Config.Noclip and "ON" or "OFF"),
     TextColor3 = Color3.new(1, 1, 1),
@@ -732,18 +674,16 @@ noclipBtn.MouseButton1Click:Connect(function()
     Config.Noclip = not Config.Noclip
     noclipBtn.Text = "Noclip: " .. (Config.Noclip and "ON" or "OFF")
     noclipBtn.BackgroundColor3 = Config.Noclip and Color3.fromRGB(50, 60, 55) or Color3.fromRGB(70, 50, 50)
-    if not Config.Noclip then
-        if LP.Character then
-            for _, part in ipairs(LP.Character:GetDescendants()) do
-                if part:IsA("BasePart") then part.CanCollide = true end
-            end
+    if not Config.Noclip and LP.Character then
+        for _, part in ipairs(LP.Character:GetDescendants()) do
+            if part:IsA("BasePart") then part.CanCollide = true end
         end
     end
 end)
 
 local purgeBtn = mk(cfgBox, "TextButton", {
     Size = UDim2.new(0, 140, 0, 26),
-    Position = UDim2.fromOffset(8, 76),
+    Position = UDim2.fromOffset(156, 44),
     BackgroundColor3 = Color3.fromRGB(50, 55, 65),
     Text = "Purge: " .. (Config.AutoPurge and "ON" or "OFF"),
     TextColor3 = Color3.new(1, 1, 1),
@@ -760,8 +700,8 @@ purgeBtn.MouseButton1Click:Connect(function()
 end)
 
 local rayBtn = mk(cfgBox, "TextButton", {
-    Size = UDim2.new(0, 140, 0, 26),
-    Position = UDim2.fromOffset(156, 76),
+    Size = UDim2.new(1, -16, 0, 26),
+    Position = UDim2.fromOffset(8, 76),
     BackgroundColor3 = Color3.fromRGB(50, 60, 55),
     Text = "Ray: " .. (Config.ShowRay and "ON" or "OFF"),
     TextColor3 = Color3.new(1, 1, 1),
@@ -805,7 +745,7 @@ local statRuntime = mk(statsBox, "TextLabel", {
     TextXAlignment = Enum.TextXAlignment.Left,
 })
 
--- Drag window
+-- Drag
 local dragging, dragStart, startPos
 titleBar.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -826,7 +766,7 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
--- Live update stats
+-- Live update
 task.spawn(function()
     while gui.Parent do
         statusS.Text = "Sell: " .. Status.Sell
@@ -841,13 +781,11 @@ task.spawn(function()
     end
 end)
 
--- Hotkey
 UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
     if input.KeyCode == Enum.KeyCode.F8 then
         local on = not (Config.Harvest or Config.Water or Config.Sell)
         Config.Harvest, Config.Water, Config.Sell = on, on, on
-        
         for _, row in ipairs(content:GetChildren()) do
             if row:IsA("Frame") and row.BackgroundColor3 == Color3.fromRGB(32, 40, 46) then
                 local btn = row:FindFirstChildWhichIsA("TextButton")
@@ -865,4 +803,4 @@ UserInputService.InputBegan:Connect(function(input, gp)
     end
 end)
 
-print("[AutoFarm V5] โหลดเสร็จ — แก้ไขระบบรดน้ำและเก็บให้เสถียรขึ้น")
+print("[AutoFarm V6] โหลดเสร็จ — ระบบกด Prompt ถูกต้องแล้ว")
