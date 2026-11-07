@@ -2713,8 +2713,8 @@ function run(Player)
 
 			CurrentClothes = {},
 			PartList = Function.PartListDefault(),
-			BreastsScale = 1,
-      ButtsScale = 1,
+			BreastsScale = 3,
+      ButtsScale = 1.5,
       VaginaScale = 2,      -- ← เพิ่มบรรทัดนี้
 			BodyPartPhysics = true,
 			CurrentPartList = {
