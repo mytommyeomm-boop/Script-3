@@ -2713,8 +2713,9 @@ function run(Player)
 
 			CurrentClothes = {},
 			PartList = Function.PartListDefault(),
-			BreastsScale = 3,
-			ButtsScale = 0.55,
+			BreastsScale = 1,
+      ButtsScale = 1,
+      VaginaScale = 2,      -- ← เพิ่มบรรทัดนี้
 			BodyPartPhysics = true,
 			CurrentPartList = {
 				Organ = {},
@@ -3629,19 +3630,20 @@ Function.SpringCreate(
 				end)
 
 				pcall(function()
-					for name, object in pairs(SelectedMorph.Vaginas) do
-						local VModel = createContainer("Closed")
-						VModel.Color = Character.Torso.Color
-						local Weld = createWeld(VModel)
-						Weld.Part0 = Morph.Torso
-						Weld.Part1 = VModel
+	for name, object in pairs(SelectedMorph.Vaginas) do
+		local VModel = createContainer("Closed")
+		VModel.Color = Character.Torso.Color
+		local Weld = createWeld(VModel)
+		Weld.Part0 = Morph.Torso
+		Weld.Part1 = VModel
 
-
-						for _, OBJECT in pairs(object) do
-							Function.Weld(OBJECT, Character,Extra, Data)
-						end
-					end
-				end)
+		for _, OBJECT in pairs(object) do
+			OBJECT["Scale"] = "VaginaScale"
+			OBJECT["AdjustScale"] = {"Size", "CFrame", "CFrame1"}
+			Function.Weld(OBJECT, Character,Extra, Data)
+		end
+	end
+end)
 
 				pcall(function()
 					for name, object in pairs(SelectedMorph.Breasts) do
